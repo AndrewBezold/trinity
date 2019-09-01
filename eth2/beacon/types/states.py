@@ -1,30 +1,16 @@
-from typing import (
-    Sequence,
-)
+from typing import Any, Callable, Sequence
 
-from eth_typing import (
-    Hash32,
-)
-from eth_utils import (
-    encode_hex,
-)
-
+from eth.constants import ZERO_HASH32
+from eth_typing import Hash32
+from eth_utils import encode_hex
 import ssz
-from ssz.sedes import (
-    List,
-    bytes32,
-    uint64,
-)
+from ssz.sedes import Bitvector, List, Vector, bytes32, uint64
 
-from eth.constants import (
-    ZERO_HASH32,
-)
-
-from eth2.beacon._utils.hash import (
-    hash_eth2,
-)
-from eth2.beacon.helpers import slot_to_epoch
+from eth2._utils.tuple import update_tuple_item, update_tuple_item_with_fn
+from eth2.beacon.constants import JUSTIFICATION_BITS_LENGTH
+from eth2.beacon.helpers import compute_epoch_of_slot
 from eth2.beacon.typing import (
+    Bitfield,
     Epoch,
     Gwei,
     Shard,
@@ -32,275 +18,248 @@ from eth2.beacon.typing import (
     Timestamp,
     ValidatorIndex,
 )
+from eth2.configs import Eth2Config
 
-from .eth1_data import Eth1Data
-from .eth1_data_vote import Eth1DataVote
-from .crosslink_records import CrosslinkRecord
-from .forks import Fork
-from .pending_attestation_records import PendingAttestationRecord
-from .validator_records import ValidatorRecord
+from .block_headers import BeaconBlockHeader, default_beacon_block_header
+from .checkpoints import Checkpoint, default_checkpoint
+from .crosslinks import Crosslink, default_crosslink
+from .defaults import (
+    default_shard,
+    default_slot,
+    default_timestamp,
+    default_tuple,
+    default_tuple_of_size,
+)
+from .eth1_data import Eth1Data, default_eth1_data
+from .forks import Fork, default_fork
+from .pending_attestations import PendingAttestation
+from .validators import Validator
+
+default_justification_bits = Bitfield((False,) * JUSTIFICATION_BITS_LENGTH)
 
 
 class BeaconState(ssz.Serializable):
 
     fields = [
-        # Misc
-        ('slot', uint64),
-        ('genesis_time', uint64),
-        ('fork', Fork),  # For versioning hard forks
-
-        # Validator registry
-        ('validator_registry', List(ValidatorRecord)),
-        ('validator_balances', List(uint64)),
-        ('validator_registry_update_epoch', uint64),
-
-        # Randomness and committees
-        ('latest_randao_mixes', List(bytes32)),
-        ('previous_shuffling_start_shard', uint64),
-        ('current_shuffling_start_shard', uint64),
-        ('previous_shuffling_epoch', uint64),
-        ('current_shuffling_epoch', uint64),
-        ('previous_shuffling_seed', bytes32),
-        ('current_shuffling_seed', bytes32),
-
-        # Finality
-        ('previous_justified_epoch', uint64),
-        ('justified_epoch', uint64),
-
-        # Note: justification_bitfield is meant to be defined as an integer type,
-        # so its bit operation is in Python and is easier to specify and implement.
-        ('justification_bitfield', uint64),
-        ('finalized_epoch', uint64),
-
-        # Recent state
-        ('latest_crosslinks', List(CrosslinkRecord)),
-        ('latest_block_roots', List(bytes32)),  # Needed to process attestations, older to newer  # noqa: E501
-        ('latest_active_index_roots', List(bytes32)),
-        ('latest_slashed_balances', List(uint64)),  # Balances slashed at every withdrawal period  # noqa: E501
-        ('latest_attestations', List(PendingAttestationRecord)),
-        ('batched_block_roots', List(bytes32)),  # allow for a log-sized Merkle proof from any block to any historical block root"  # noqa: E501
-
+        # Versioning
+        ("genesis_time", uint64),
+        ("slot", uint64),
+        ("fork", Fork),
+        # History
+        ("latest_block_header", BeaconBlockHeader),
+        (
+            "block_roots",
+            Vector(bytes32, 1),
+        ),  # Needed to process attestations, older to newer  # noqa: E501
+        ("state_roots", Vector(bytes32, 1)),
+        (
+            "historical_roots",
+            List(bytes32, 1),
+        ),  # allow for a log-sized Merkle proof from any block to any historical block root  # noqa: E501
         # Ethereum 1.0 chain
-        ('latest_eth1_data', Eth1Data),
-        ('eth1_data_votes', List(Eth1DataVote)),
-        ('deposit_index', uint64),
+        ("eth1_data", Eth1Data),
+        ("eth1_data_votes", List(Eth1Data, 1)),
+        ("eth1_deposit_index", uint64),
+        # Validator registry
+        ("validators", List(Validator, 1)),
+        ("balances", List(uint64, 1)),
+        # Shuffling
+        ("start_shard", uint64),
+        ("randao_mixes", Vector(bytes32, 1)),
+        ("active_index_roots", Vector(bytes32, 1)),
+        ("compact_committees_roots", Vector(bytes32, 1)),
+        # Slashings
+        (
+            "slashings",
+            Vector(uint64, 1),
+        ),  # Balances slashed at every withdrawal period  # noqa: E501
+        # Attestations
+        ("previous_epoch_attestations", List(PendingAttestation, 1)),
+        ("current_epoch_attestations", List(PendingAttestation, 1)),
+        # Crosslinks
+        ("previous_crosslinks", Vector(Crosslink, 1)),
+        ("current_crosslinks", Vector(Crosslink, 1)),
+        # Justification
+        ("justification_bits", Bitvector(JUSTIFICATION_BITS_LENGTH)),
+        ("previous_justified_checkpoint", Checkpoint),
+        ("current_justified_checkpoint", Checkpoint),
+        # Finality
+        ("finalized_checkpoint", Checkpoint),
     ]
 
     def __init__(
-            self,
-            *,
-            # Misc
-            slot: Slot,
-            genesis_time: Timestamp,
-            fork: Fork,
-            # Validator registry
-            validator_registry: Sequence[ValidatorRecord],
-            validator_balances: Sequence[Gwei],
-            validator_registry_update_epoch: Epoch,
-            # Randomness and committees
-            latest_randao_mixes: Sequence[Hash32],
-            previous_shuffling_start_shard: Shard,
-            current_shuffling_start_shard: Shard,
-            previous_shuffling_epoch: Epoch,
-            current_shuffling_epoch: Epoch,
-            previous_shuffling_seed: Hash32,
-            current_shuffling_seed: Hash32,
-            # Finality
-            previous_justified_epoch: Epoch,
-            justified_epoch: Epoch,
-            justification_bitfield: int,
-            finalized_epoch: Epoch,
-            # Recent state
-            latest_crosslinks: Sequence[CrosslinkRecord],
-            latest_block_roots: Sequence[Hash32],
-            latest_active_index_roots: Sequence[Hash32],
-            latest_slashed_balances: Sequence[Gwei],
-            batched_block_roots: Sequence[Hash32],
-            latest_attestations: Sequence[PendingAttestationRecord],
-            # Ethereum 1.0 chain
-            latest_eth1_data: Eth1Data,
-            eth1_data_votes: Sequence[Eth1DataVote],
-            deposit_index: int) -> None:
-        if len(validator_registry) != len(validator_balances):
+        self,
+        *,
+        genesis_time: Timestamp = default_timestamp,
+        slot: Slot = default_slot,
+        fork: Fork = default_fork,
+        latest_block_header: BeaconBlockHeader = default_beacon_block_header,
+        block_roots: Sequence[Hash32] = default_tuple,
+        state_roots: Sequence[Hash32] = default_tuple,
+        historical_roots: Sequence[Hash32] = default_tuple,
+        eth1_data: Eth1Data = default_eth1_data,
+        eth1_data_votes: Sequence[Eth1Data] = default_tuple,
+        eth1_deposit_index: int = 0,
+        validators: Sequence[Validator] = default_tuple,
+        balances: Sequence[Gwei] = default_tuple,
+        start_shard: Shard = default_shard,
+        randao_mixes: Sequence[Hash32] = default_tuple,
+        active_index_roots: Sequence[Hash32] = default_tuple,
+        compact_committees_roots: Sequence[Hash32] = default_tuple,
+        slashings: Sequence[Gwei] = default_tuple,
+        previous_epoch_attestations: Sequence[PendingAttestation] = default_tuple,
+        current_epoch_attestations: Sequence[PendingAttestation] = default_tuple,
+        previous_crosslinks: Sequence[Crosslink] = default_tuple,
+        current_crosslinks: Sequence[Crosslink] = default_tuple,
+        justification_bits: Bitfield = default_justification_bits,
+        previous_justified_checkpoint: Checkpoint = default_checkpoint,
+        current_justified_checkpoint: Checkpoint = default_checkpoint,
+        finalized_checkpoint: Checkpoint = default_checkpoint,
+        config: Eth2Config = None,
+    ) -> None:
+        if len(validators) != len(balances):
             raise ValueError(
-                "The length of validator_registry and validator_balances should be the same."
+                "The length of validators and balances lists should be the same."
             )
+
+        if config:
+            # try to provide sane defaults
+            if block_roots == default_tuple:
+                block_roots = default_tuple_of_size(
+                    config.SLOTS_PER_HISTORICAL_ROOT, ZERO_HASH32
+                )
+            if state_roots == default_tuple:
+                state_roots = default_tuple_of_size(
+                    config.SLOTS_PER_HISTORICAL_ROOT, ZERO_HASH32
+                )
+            if randao_mixes == default_tuple:
+                randao_mixes = default_tuple_of_size(
+                    config.EPOCHS_PER_HISTORICAL_VECTOR, ZERO_HASH32
+                )
+            if active_index_roots == default_tuple:
+                active_index_roots = default_tuple_of_size(
+                    config.EPOCHS_PER_HISTORICAL_VECTOR, ZERO_HASH32
+                )
+            if compact_committees_roots == default_tuple:
+                compact_committees_roots = default_tuple_of_size(
+                    config.EPOCHS_PER_HISTORICAL_VECTOR, ZERO_HASH32
+                )
+            if slashings == default_tuple:
+                slashings = default_tuple_of_size(
+                    config.EPOCHS_PER_SLASHINGS_VECTOR, Gwei(0)
+                )
+            if previous_crosslinks == default_tuple:
+                previous_crosslinks = default_tuple_of_size(
+                    config.SHARD_COUNT, default_crosslink
+                )
+            if current_crosslinks == default_tuple:
+                current_crosslinks = default_tuple_of_size(
+                    config.SHARD_COUNT, default_crosslink
+                )
+
         super().__init__(
-            # Misc
-            slot=slot,
             genesis_time=genesis_time,
+            slot=slot,
             fork=fork,
-            # Validator registry
-            validator_registry=validator_registry,
-            validator_balances=validator_balances,
-            validator_registry_update_epoch=validator_registry_update_epoch,
-            # Randomness and committees
-            latest_randao_mixes=latest_randao_mixes,
-            previous_shuffling_start_shard=previous_shuffling_start_shard,
-            current_shuffling_start_shard=current_shuffling_start_shard,
-            previous_shuffling_epoch=previous_shuffling_epoch,
-            current_shuffling_epoch=current_shuffling_epoch,
-            previous_shuffling_seed=previous_shuffling_seed,
-            current_shuffling_seed=current_shuffling_seed,
-            # Finality
-            previous_justified_epoch=previous_justified_epoch,
-            justified_epoch=justified_epoch,
-            justification_bitfield=justification_bitfield,
-            finalized_epoch=finalized_epoch,
-            # Recent state
-            latest_crosslinks=latest_crosslinks,
-            latest_block_roots=latest_block_roots,
-            latest_active_index_roots=latest_active_index_roots,
-            latest_slashed_balances=latest_slashed_balances,
-            latest_attestations=latest_attestations,
-            batched_block_roots=batched_block_roots,
-            # Ethereum 1.0 chain
-            latest_eth1_data=latest_eth1_data,
+            latest_block_header=latest_block_header,
+            block_roots=block_roots,
+            state_roots=state_roots,
+            historical_roots=historical_roots,
+            eth1_data=eth1_data,
             eth1_data_votes=eth1_data_votes,
-            deposit_index=deposit_index,
+            eth1_deposit_index=eth1_deposit_index,
+            validators=validators,
+            balances=balances,
+            start_shard=start_shard,
+            randao_mixes=randao_mixes,
+            active_index_roots=active_index_roots,
+            compact_committees_roots=compact_committees_roots,
+            slashings=slashings,
+            previous_epoch_attestations=previous_epoch_attestations,
+            current_epoch_attestations=current_epoch_attestations,
+            previous_crosslinks=previous_crosslinks,
+            current_crosslinks=current_crosslinks,
+            justification_bits=justification_bits,
+            previous_justified_checkpoint=previous_justified_checkpoint,
+            current_justified_checkpoint=current_justified_checkpoint,
+            finalized_checkpoint=finalized_checkpoint,
         )
 
     def __repr__(self) -> str:
-        return 'BeaconState #{0}>'.format(
-            encode_hex(self.root)[2:10],
-        )
-
-    _hash = None
+        return f"<BeaconState #{self.slot} {encode_hex(self.hash_tree_root)[2:10]}>"
 
     @property
-    def hash(self) -> Hash32:
-        if self._hash is None:
-            self._hash = hash_eth2(ssz.encode(self))
-        return self._hash
+    def validator_count(self) -> int:
+        return len(self.validators)
 
-    @property
-    def root(self) -> Hash32:
-        # Alias of `hash`.
-        # Using flat hash, might change to SSZ tree hash.
-        return self.hash
-
-    @property
-    def num_validators(self) -> int:
-        return len(self.validator_registry)
-
-    @property
-    def num_crosslinks(self) -> int:
-        return len(self.latest_crosslinks)
-
-    @classmethod
-    def create_filled_state(cls,
-                            *,
-                            genesis_epoch: Epoch,
-                            genesis_start_shard: Shard,
-                            genesis_slot: Slot,
-                            shard_count: int,
-                            latest_block_roots_length: int,
-                            latest_active_index_roots_length: int,
-                            latest_randao_mixes_length: int,
-                            latest_slashed_exit_length: int,
-                            activated_genesis_validators: Sequence[ValidatorRecord]=(),
-                            genesis_balances: Sequence[Gwei]=()) -> 'BeaconState':
-        return cls(
-            # Misc
-            slot=genesis_slot,
-            genesis_time=Timestamp(0),
-            fork=Fork(
-                previous_version=0,
-                current_version=0,
-                epoch=genesis_epoch,
-            ),
-
-            # Validator registry
-            validator_registry=activated_genesis_validators,
-            validator_balances=genesis_balances,
-            validator_registry_update_epoch=genesis_epoch,
-
-            # Randomness and committees
-            latest_randao_mixes=(ZERO_HASH32,) * latest_randao_mixes_length,
-            previous_shuffling_start_shard=genesis_start_shard,
-            current_shuffling_start_shard=genesis_start_shard,
-            previous_shuffling_epoch=genesis_epoch,
-            current_shuffling_epoch=genesis_epoch,
-            previous_shuffling_seed=ZERO_HASH32,
-            current_shuffling_seed=ZERO_HASH32,
-
-            # Finality
-            previous_justified_epoch=genesis_epoch,
-            justified_epoch=genesis_epoch,
-            justification_bitfield=genesis_slot,
-            finalized_epoch=genesis_epoch,
-
-            # Recent state
-            latest_crosslinks=(
-                (
-                    CrosslinkRecord(
-                        epoch=genesis_epoch,
-                        crosslink_data_root=ZERO_HASH32,
-                    ),
-                ) * shard_count
-            ),
-            latest_block_roots=(ZERO_HASH32,) * latest_block_roots_length,
-            latest_active_index_roots=(ZERO_HASH32,) * latest_active_index_roots_length,
-            latest_slashed_balances=(Gwei(0),) * latest_slashed_exit_length,
-            latest_attestations=(),
-            batched_block_roots=(),
-
-            # Ethereum 1.0 chain data
-            latest_eth1_data=Eth1Data.create_empty_data(),
-            eth1_data_votes=(),
-            deposit_index=len(activated_genesis_validators),
-        )
-
-    def update_validator_registry(self,
-                                  validator_index: ValidatorIndex,
-                                  validator: ValidatorRecord) -> 'BeaconState':
+    def update_validator(
+        self,
+        validator_index: ValidatorIndex,
+        validator: Validator,
+        balance: Gwei = None,
+    ) -> "BeaconState":
         """
-        Replace ``self.validator_registry[validator_index]`` with ``validator``.
+        Replace ``self.validators[validator_index]`` with ``validator``.
+
+        Callers can optionally provide a ``balance`` which will replace
+        ``self.balances[validator_index] with ``balance``.
         """
-        if validator_index >= self.num_validators or validator_index < 0:
+        if (
+            validator_index >= len(self.validators)
+            or validator_index >= len(self.balances)
+            or validator_index < 0
+        ):
             raise IndexError("Incorrect validator index")
 
-        validator_registry = list(self.validator_registry)
-        validator_registry[validator_index] = validator
+        state = self.update_validator_with_fn(validator_index, lambda *_: validator)
+        if balance:
+            return state._update_validator_balance(validator_index, balance)
+        else:
+            return state
 
-        updated_state = self.copy(
-            validator_registry=tuple(validator_registry),
+    def update_validator_with_fn(
+        self,
+        validator_index: ValidatorIndex,
+        fn: Callable[[Validator, Any], Validator],
+        *args: Any,
+    ) -> "BeaconState":
+        """
+        Replace ``self.validators[validator_index]`` with
+        the result of calling ``fn`` on the existing ``validator``.
+        Any auxillary args passed in ``args`` are provided to ``fn`` along with the
+        ``validator``.
+        """
+        if validator_index >= len(self.validators) or validator_index < 0:
+            raise IndexError("Incorrect validator index")
+
+        return self.copy(
+            validators=update_tuple_item_with_fn(
+                self.validators, validator_index, fn, *args
+            )
         )
-        return updated_state
 
-    def update_validator_balance(self,
-                                 validator_index: ValidatorIndex,
-                                 balance: Gwei) -> 'BeaconState':
+    def _update_validator_balance(
+        self, validator_index: ValidatorIndex, balance: Gwei
+    ) -> "BeaconState":
         """
         Update the balance of validator of the given ``validator_index``.
         """
-        if validator_index >= self.num_validators or validator_index < 0:
+        if validator_index >= len(self.balances) or validator_index < 0:
             raise IndexError("Incorrect validator index")
 
-        validator_balances = list(self.validator_balances)
-        validator_balances[validator_index] = balance
-
-        updated_state = self.copy(
-            validator_balances=tuple(validator_balances),
+        return self.copy(
+            balances=update_tuple_item(self.balances, validator_index, balance)
         )
-        return updated_state
-
-    def update_validator(self,
-                         validator_index: ValidatorIndex,
-                         validator: ValidatorRecord,
-                         balance: Gwei) -> 'BeaconState':
-        """
-        Update the ``ValidatorRecord`` and balance of validator of the given ``validator_index``.
-        """
-        state = self.update_validator_registry(validator_index, validator)
-        state = state.update_validator_balance(validator_index, balance)
-        return state
 
     def current_epoch(self, slots_per_epoch: int) -> Epoch:
-        return slot_to_epoch(self.slot, slots_per_epoch)
+        return compute_epoch_of_slot(self.slot, slots_per_epoch)
 
-    def previous_epoch(self, slots_per_epoch: int, genesis_epoch: int) -> Epoch:
-        return Epoch(max(self.current_epoch(slots_per_epoch) - 1, genesis_epoch))
+    def previous_epoch(self, slots_per_epoch: int, genesis_epoch: Epoch) -> Epoch:
+        current_epoch = self.current_epoch(slots_per_epoch)
+        if current_epoch == genesis_epoch:
+            return genesis_epoch
+        else:
+            return Epoch(current_epoch - 1)
 
     def next_epoch(self, slots_per_epoch: int) -> Epoch:
         return Epoch(self.current_epoch(slots_per_epoch) + 1)

@@ -1,49 +1,25 @@
-from abc import (
-    ABC,
-    abstractmethod,
-)
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Sequence
 
-from typing import (
-    Sequence,
-    TYPE_CHECKING,
-)
-
-from eth_typing import (
-    Hash32,
-)
-from eth_utils import (
-    encode_hex,
-)
-
+from eth._utils.datatypes import Configurable
+from eth.constants import ZERO_HASH32
+from eth_typing import BLSSignature, Hash32
+from eth_utils import encode_hex
 import ssz
-from ssz.sedes import (
-    List,
-    bytes32,
-    bytes96,
-    uint64,
-)
+from ssz.sedes import List, bytes32, bytes96, uint64
 
-
-from eth._utils.datatypes import (
-    Configurable,
-)
-
-from eth2.beacon._utils.hash import hash_eth2
-from eth2.beacon.constants import EMPTY_SIGNATURE
-from eth2.beacon.typing import (
-    BLSSignature,
-    Slot,
-    FromBlockParams,
-)
-
+from eth2.beacon.constants import EMPTY_SIGNATURE, GENESIS_PARENT_ROOT
+from eth2.beacon.typing import FromBlockParams, Slot
 
 from .attestations import Attestation
 from .attester_slashings import AttesterSlashing
+from .block_headers import BeaconBlockHeader
+from .defaults import default_slot, default_tuple
 from .deposits import Deposit
-from .eth1_data import Eth1Data
+from .eth1_data import Eth1Data, default_eth1_data
+from .proposer_slashings import ProposerSlashing
 from .transfers import Transfer
 from .voluntary_exits import VoluntaryExit
-from .proposer_slashings import ProposerSlashing
 
 if TYPE_CHECKING:
     from eth2.beacon.db.chain import BaseBeaconChainDB  # noqa: F401
@@ -52,22 +28,34 @@ if TYPE_CHECKING:
 class BeaconBlockBody(ssz.Serializable):
 
     fields = [
-        ('proposer_slashings', List(ProposerSlashing)),
-        ('attester_slashings', List(AttesterSlashing)),
-        ('attestations', List(Attestation)),
-        ('deposits', List(Deposit)),
-        ('voluntary_exits', List(VoluntaryExit)),
-        ('transfers', List(Transfer)),
+        ("randao_reveal", bytes96),
+        ("eth1_data", Eth1Data),
+        ("graffiti", bytes32),
+        ("proposer_slashings", List(ProposerSlashing, 1)),
+        ("attester_slashings", List(AttesterSlashing, 1)),
+        ("attestations", List(Attestation, 1)),
+        ("deposits", List(Deposit, 1)),
+        ("voluntary_exits", List(VoluntaryExit, 1)),
+        ("transfers", List(Transfer, 1)),
     ]
 
-    def __init__(self,
-                 proposer_slashings: Sequence[ProposerSlashing],
-                 attester_slashings: Sequence[AttesterSlashing],
-                 attestations: Sequence[Attestation],
-                 deposits: Sequence[Deposit],
-                 voluntary_exits: Sequence[VoluntaryExit],
-                 transfers: Sequence[Transfer])-> None:
+    def __init__(
+        self,
+        *,
+        randao_reveal: bytes96 = EMPTY_SIGNATURE,
+        eth1_data: Eth1Data = default_eth1_data,
+        graffiti: Hash32 = ZERO_HASH32,
+        proposer_slashings: Sequence[ProposerSlashing] = default_tuple,
+        attester_slashings: Sequence[AttesterSlashing] = default_tuple,
+        attestations: Sequence[Attestation] = default_tuple,
+        deposits: Sequence[Deposit] = default_tuple,
+        voluntary_exits: Sequence[VoluntaryExit] = default_tuple,
+        transfers: Sequence[Transfer] = default_tuple,
+    ) -> None:
         super().__init__(
+            randao_reveal=randao_reveal,
+            eth1_data=eth1_data,
+            graffiti=graffiti,
             proposer_slashings=proposer_slashings,
             attester_slashings=attester_slashings,
             attestations=attestations,
@@ -76,126 +64,86 @@ class BeaconBlockBody(ssz.Serializable):
             transfers=transfers,
         )
 
-    @classmethod
-    def create_empty_body(cls) -> 'BeaconBlockBody':
-        return cls(
-            proposer_slashings=(),
-            attester_slashings=(),
-            attestations=(),
-            deposits=(),
-            voluntary_exits=(),
-            transfers=(),
-        )
-
     @property
     def is_empty(self) -> bool:
-        return (
-            self.proposer_slashings == () and
-            self.attester_slashings == () and
-            self.attestations == () and
-            self.deposits == () and
-            self.voluntary_exits == () and
-            self.transfers == ()
-        )
-
-    @classmethod
-    def cast_block_body(cls,
-                        body: 'BeaconBlockBody') -> 'BeaconBlockBody':
-        return cls(
-            proposer_slashings=body.proposer_slashings,
-            attester_slashings=body.attester_slashings,
-            attestations=body.attestations,
-            deposits=body.deposits,
-            voluntary_exits=body.voluntary_exits,
-            transfers=body.transfers,
-        )
+        return self == BeaconBlockBody()
 
 
-class BaseBeaconBlock(ssz.Serializable, Configurable, ABC):
+default_beacon_block_body = BeaconBlockBody()
+
+
+class BaseBeaconBlock(ssz.SignedSerializable, Configurable, ABC):
     fields = [
-        #
-        # Header
-        #
-        ('slot', uint64),
-        ('parent_root', bytes32),
-        ('state_root', bytes32),
-        ('randao_reveal', bytes96),
-        ('eth1_data', Eth1Data),
-        ('signature', bytes96),
-
-        #
-        # Body
-        #
-        ('body', BeaconBlockBody),
+        ("slot", uint64),
+        ("parent_root", bytes32),
+        ("state_root", bytes32),
+        ("body", BeaconBlockBody),
+        ("signature", bytes96),
     ]
 
-    def __init__(self,
-                 slot: Slot,
-                 parent_root: Hash32,
-                 state_root: Hash32,
-                 randao_reveal: BLSSignature,
-                 eth1_data: Eth1Data,
-                 body: BeaconBlockBody,
-                 signature: BLSSignature=EMPTY_SIGNATURE) -> None:
+    def __init__(
+        self,
+        *,
+        slot: Slot = default_slot,
+        parent_root: Hash32 = ZERO_HASH32,
+        state_root: Hash32 = ZERO_HASH32,
+        body: BeaconBlockBody = default_beacon_block_body,
+        signature: BLSSignature = EMPTY_SIGNATURE,
+    ) -> None:
         super().__init__(
             slot=slot,
             parent_root=parent_root,
             state_root=state_root,
-            randao_reveal=randao_reveal,
-            eth1_data=eth1_data,
-            signature=signature,
             body=body,
+            signature=signature,
         )
 
     def __repr__(self) -> str:
-        return '<Block #{0} {1}>'.format(
-            self.slot,
-            encode_hex(self.root)[2:10],
+        return (
+            f"<Block #{self.slot} "
+            f"parent_root={encode_hex(self.parent_root)[2:10]} "
+            f"signing_root={encode_hex(self.signing_root)[2:10]} "
+            f"state_root={encode_hex(self.state_root)[2:10]} "
+            f"attestations={self.body.attestations} "
+            ">"
         )
 
-    _hash = None
+    @property
+    def is_genesis(self) -> bool:
+        return self.parent_root == GENESIS_PARENT_ROOT
 
     @property
-    def hash(self) -> Hash32:
-        if self._hash is None:
-            self._hash = hash_eth2(ssz.encode(self))
-        return self._hash
-
-    @property
-    def root(self) -> Hash32:
-        # Alias of `hash`.
-        # Using flat hash, might change to SSZ tree hash.
-        return self.hash
-
-    @property
-    def num_attestations(self) -> int:
-        return len(self.body.attestations)
-
-    @property
-    def block_without_signature_root(self) -> Hash32:
-        return self.copy(
-            signature=EMPTY_SIGNATURE
-        ).root
+    def header(self) -> BeaconBlockHeader:
+        return BeaconBlockHeader(
+            slot=self.slot,
+            parent_root=self.parent_root,
+            state_root=self.state_root,
+            body_root=self.body.hash_tree_root,
+            signature=self.signature,
+        )
 
     @classmethod
     @abstractmethod
-    def from_root(cls, root: Hash32, chaindb: 'BaseBeaconChainDB') -> 'BaseBeaconBlock':
+    def from_root(cls, root: Hash32, chaindb: "BaseBeaconChainDB") -> "BaseBeaconBlock":
         """
         Return the block denoted by the given block root.
         """
-        raise NotImplementedError("Must be implemented by subclasses")
+        ...
 
 
 class BeaconBlock(BaseBeaconBlock):
     block_body_class = BeaconBlockBody
 
     @classmethod
-    def from_root(cls, root: Hash32, chaindb: 'BaseBeaconChainDB') -> 'BeaconBlock':
+    def from_root(cls, root: Hash32, chaindb: "BaseBeaconChainDB") -> "BeaconBlock":
         """
         Return the block denoted by the given block ``root``.
         """
         block = chaindb.get_block_by_root(root, cls)
         body = cls.block_body_class(
+            randao_reveal=block.body.randao_reveal,
+            eth1_data=block.body.eth1_data,
+            graffiti=block.body.graffiti,
             proposer_slashings=block.body.proposer_slashings,
             attester_slashings=block.body.attester_slashings,
             attestations=block.body.attestations,
@@ -208,19 +156,17 @@ class BeaconBlock(BaseBeaconBlock):
             slot=block.slot,
             parent_root=block.parent_root,
             state_root=block.state_root,
-            randao_reveal=block.randao_reveal,
-            eth1_data=block.eth1_data,
-            signature=block.signature,
             body=body,
+            signature=block.signature,
         )
 
     @classmethod
-    def from_parent(cls,
-                    parent_block: 'BaseBeaconBlock',
-                    block_params: FromBlockParams) -> 'BaseBeaconBlock':
+    def from_parent(
+        cls, parent_block: "BaseBeaconBlock", block_params: FromBlockParams
+    ) -> "BaseBeaconBlock":
         """
-        Initialize a new block with the `parent` block as the block's
-        parent hash.
+        Initialize a new block with the ``parent_block`` as the block's
+        previous block root.
         """
         if block_params.slot is None:
             slot = parent_block.slot + 1
@@ -229,23 +175,27 @@ class BeaconBlock(BaseBeaconBlock):
 
         return cls(
             slot=slot,
-            parent_root=parent_block.root,
+            parent_root=parent_block.signing_root,
             state_root=parent_block.state_root,
-            randao_reveal=EMPTY_SIGNATURE,
-            eth1_data=parent_block.eth1_data,
-            signature=EMPTY_SIGNATURE,
-            body=cls.block_body_class.create_empty_body(),
+            body=cls.block_body_class(),
         )
 
     @classmethod
-    def convert_block(cls,
-                      block: 'BaseBeaconBlock') -> 'BeaconBlock':
+    def convert_block(cls, block: "BaseBeaconBlock") -> "BeaconBlock":
         return cls(
             slot=block.slot,
             parent_root=block.parent_root,
             state_root=block.state_root,
-            randao_reveal=block.randao_reveal,
-            eth1_data=block.eth1_data,
-            signature=block.signature,
             body=block.body,
+            signature=block.signature,
+        )
+
+    @classmethod
+    def from_header(cls, header: BeaconBlockHeader) -> "BeaconBlock":
+        return cls(
+            slot=header.slot,
+            parent_root=header.parent_root,
+            state_root=header.state_root,
+            signature=header.signature,
+            body=BeaconBlockBody(),
         )

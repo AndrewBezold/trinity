@@ -3,7 +3,11 @@ import json
 import os
 import pytest
 import time
+import uuid
 
+from eth._utils.address import (
+    force_bytes_to_address,
+)
 from eth_utils.toolz import (
     assoc,
 )
@@ -12,16 +16,17 @@ from eth_utils import (
     function_signature_to_4byte_selector,
     to_bytes,
     to_hex,
+    to_int,
 )
 
-from p2p.events import (
-    PeerCountRequest,
-    PeerCountResponse,
-    ConnectToNodeCommand,
-)
 from trinity.nodes.events import (
     NetworkIdRequest,
     NetworkIdResponse,
+)
+from trinity.protocol.common.events import (
+    ConnectToNodeCommand,
+    PeerCountRequest,
+    PeerCountResponse,
 )
 from trinity.sync.common.events import (
     SyncingRequest,
@@ -32,6 +37,10 @@ from trinity.sync.common.types import (
 )
 
 from trinity._utils.version import construct_trinity_client_identifier
+
+from tests.core.integration_test_helpers import (
+    mock_request_response,
+)
 
 
 def wait_for(path):
@@ -77,7 +86,11 @@ def can_decode_json(potential):
 async def get_ipc_response(
         jsonrpc_ipc_pipe_path,
         request_msg,
-        event_loop):
+        event_loop,
+        event_bus):
+
+    # Give event subsriptions a moment to propagate.
+    await asyncio.sleep(0.01)
 
     assert wait_for(jsonrpc_ipc_pipe_path), "IPC server did not successfully start with IPC file"
 
@@ -91,6 +104,19 @@ async def get_ipc_response(
 
     writer.close()
     return json.loads(result_bytes.decode())
+
+
+def transfer_eth(chain, sender_private_key, value, to):
+    tx = chain.create_unsigned_transaction(
+        nonce=0,
+        gas_price=1,
+        gas=3138525,
+        data=uuid.uuid4().bytes,
+        to=to,
+        value=value
+    ).as_signed_transaction(sender_private_key)
+    chain.apply_transaction(tx)
+    chain.mine_block()
 
 
 @pytest.fixture
@@ -147,15 +173,6 @@ def genesis_state(base_genesis_state, simple_contract_address):
 
 def uint256_to_bytes(uint):
     return to_bytes(uint).rjust(32, b'\0')
-
-
-def mock_network_id(network_id):
-    async def mock_event_bus_interaction(bus):
-        async for req in bus.stream(NetworkIdRequest):
-            bus.broadcast(NetworkIdResponse(network_id), req.broadcast_config())
-            break
-
-    return mock_event_bus_interaction
 
 
 @pytest.mark.asyncio
@@ -217,8 +234,9 @@ async def test_ipc_requests(
         request_msg,
         expected,
         event_loop,
+        event_bus,
         ipc_server):
-    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop)
+    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop, event_bus)
     assert result == expected
 
 
@@ -228,10 +246,12 @@ async def test_network_id_ipc_request(
         event_loop,
         event_bus,
         ipc_server):
-    asyncio.ensure_future(mock_network_id(1337)(event_bus))
+
+    asyncio.ensure_future(
+        mock_request_response(NetworkIdRequest, NetworkIdResponse(1337))(event_bus))
     request_msg = build_request('net_version')
     expected = {'result': '1337', 'id': 3, 'jsonrpc': '2.0'}
-    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop)
+    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop, event_bus)
     assert result == expected
 
 
@@ -321,8 +341,9 @@ async def test_estimate_gas_on_ipc(
         request_msg,
         expected,
         event_loop,
+        event_bus,
         ipc_server):
-    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop)
+    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop, event_bus)
     assert result == expected
 
 
@@ -349,8 +370,9 @@ async def test_eth_call_on_ipc(
         request_msg,
         expected,
         event_loop,
+        event_bus,
         ipc_server):
-    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop)
+    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop, event_bus)
     assert result == expected
 
 
@@ -423,6 +445,7 @@ async def test_eth_call_with_contract_on_ipc(
         gas_price,
         event_loop,
         ipc_server,
+        event_bus,
         expected):
     function_selector = function_signature_to_4byte_selector(signature)
     transaction = {
@@ -432,17 +455,8 @@ async def test_eth_call_with_contract_on_ipc(
         'data': to_hex(function_selector),
     }
     request_msg = build_request('eth_call', params=[transaction, 'latest'])
-    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop)
+    result = await get_ipc_response(jsonrpc_ipc_pipe_path, request_msg, event_loop, event_bus)
     assert result == expected
-
-
-def mock_peer_count(count):
-    async def mock_event_bus_interaction(bus):
-        async for req in bus.stream(PeerCountRequest):
-            bus.broadcast(PeerCountResponse(count), req.broadcast_config())
-            break
-
-    return mock_event_bus_interaction
 
 
 @pytest.mark.asyncio
@@ -451,12 +465,12 @@ def mock_peer_count(count):
     (
         (
             build_request('net_peerCount'),
-            mock_peer_count(1),
+            mock_request_response(PeerCountRequest, PeerCountResponse(1)),
             {'result': '0x1', 'id': 3, 'jsonrpc': '2.0'},
         ),
         (
             build_request('net_peerCount'),
-            mock_peer_count(0),
+            mock_request_response(PeerCountRequest, PeerCountResponse(0)),
             {'result': '0x0', 'id': 3, 'jsonrpc': '2.0'},
         ),
     ),
@@ -478,18 +492,10 @@ async def test_peer_pool_over_ipc(
     result = await get_ipc_response(
         jsonrpc_ipc_pipe_path,
         request_msg,
-        event_loop
+        event_loop,
+        event_bus,
     )
     assert result == expected
-
-
-def mock_syncing(is_syncing, progress=None):
-    async def mock_event_bus_interaction(bus):
-        async for req in bus.stream(SyncingRequest):
-            bus.broadcast(SyncingResponse(is_syncing, progress), req.broadcast_config())
-            break
-
-    return mock_event_bus_interaction
 
 
 @pytest.mark.asyncio
@@ -498,12 +504,12 @@ def mock_syncing(is_syncing, progress=None):
     (
         (
             build_request('eth_syncing'),
-            mock_syncing(False),
+            mock_request_response(SyncingRequest, SyncingResponse(False, None)),
             {'result': False, 'id': 3, 'jsonrpc': '2.0'},
         ),
         (
             build_request('eth_syncing'),
-            mock_syncing(True, SyncProgress(0, 1, 2)),
+            mock_request_response(SyncingRequest, SyncingResponse(True, SyncProgress(0, 1, 2))),
             {'result': {'startingBlock': 0, 'currentBlock': 1, 'highestBlock': 2}, 'id': 3,
              'jsonrpc': '2.0'},
         ),
@@ -526,7 +532,8 @@ async def test_eth_over_ipc(
     result = await get_ipc_response(
         jsonrpc_ipc_pipe_path,
         request_msg,
-        event_loop
+        event_loop,
+        event_bus,
     )
     assert result == expected
 
@@ -564,13 +571,15 @@ async def test_admin_addPeer_error_messages(
         jsonrpc_ipc_pipe_path,
         request_msg,
         event_loop,
+        event_bus,
         expected,
         ipc_server):
 
     result = await get_ipc_response(
         jsonrpc_ipc_pipe_path,
         request_msg,
-        event_loop
+        event_loop,
+        event_bus,
     )
     assert result == expected
 
@@ -592,9 +601,54 @@ async def test_admin_addPeer_fires_message(
     result = await get_ipc_response(
         jsonrpc_ipc_pipe_path,
         request,
-        event_loop
+        event_loop,
+        event_bus
     )
     assert result == {'id': 3, 'jsonrpc': '2.0', 'result': None}
 
     event = await asyncio.wait_for(future, timeout=0.1, loop=event_loop)
-    assert event.node == enode
+    assert event.remote.uri() == enode
+
+
+@pytest.fixture
+def ipc_request(jsonrpc_ipc_pipe_path, event_loop, event_bus, ipc_server):
+    async def make_request(*args):
+        request = build_request(*args)
+        return await get_ipc_response(
+            jsonrpc_ipc_pipe_path, request, event_loop, event_bus
+        )
+    return make_request
+
+
+@pytest.mark.asyncio
+async def test_get_balance_works_for_block_number(
+        chain_without_block_validation,
+        ipc_request,
+        funded_address,
+        funded_address_initial_balance,
+        funded_address_private_key
+):
+    block_no_before_transfer = (
+        await ipc_request('eth_blockNumber', [])
+    )['result']
+    transfer_eth(
+        chain=chain_without_block_validation,
+        sender_private_key=funded_address_private_key,
+        value=1,
+        to=force_bytes_to_address(b'\x10\x10')
+    )
+    balance_before = (await ipc_request(
+        'eth_getBalance',
+        [funded_address.hex(), to_int(hexstr=block_no_before_transfer)]
+    ))['result']
+    assert balance_before == hex(funded_address_initial_balance)
+
+    block_no_after_transfer = (
+        await ipc_request('eth_blockNumber', [])
+    )['result']
+    balance_after = (await ipc_request(
+        'eth_getBalance',
+        [funded_address.hex(), to_int(hexstr=block_no_after_transfer)]
+    ))['result']
+
+    assert to_int(hexstr=balance_after) < to_int(hexstr=balance_before)

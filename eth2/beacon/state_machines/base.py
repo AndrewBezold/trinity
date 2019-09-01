@@ -1,41 +1,25 @@
-from abc import (
-    ABC,
-    abstractmethod,
-)
-from typing import (
-    Tuple,
-    Type,
-)
+from abc import ABC, abstractmethod
+from typing import Tuple, Type
 
-from eth_typing import (
-    Hash32,
-)
+from eth._utils.datatypes import Configurable
 
-from eth._utils.datatypes import (
-    Configurable,
-)
-
-from eth2.beacon.configs import (  # noqa: F401
-    BeaconConfig,
-)
 from eth2.beacon.db.chain import BaseBeaconChainDB
+from eth2.beacon.fork_choice.scoring import ScoringFn as ForkChoiceScoringFn
+from eth2.beacon.operations.attestation_pool import AttestationPool
 from eth2.beacon.types.blocks import BaseBeaconBlock
 from eth2.beacon.types.states import BeaconState
-from eth2.beacon.typing import (
-    FromBlockParams,
-)
+from eth2.beacon.typing import FromBlockParams, Slot
+from eth2.configs import Eth2Config  # noqa: F401
 
-from .state_transitions import (
-    BaseStateTransition,
-)
+from .state_transitions import BaseStateTransition
 
 
 class BaseBeaconStateMachine(Configurable, ABC):
     fork = None  # type: str
     chaindb = None  # type: BaseBeaconChainDB
-    config = None  # type: BeaconConfig
+    config = None  # type: Eth2Config
 
-    block = None  # type: BaseBeaconBlock
+    slot = None  # type: Slot
     _state = None  # type: BeaconState
 
     block_class = None  # type: Type[BaseBeaconBlock]
@@ -43,59 +27,73 @@ class BaseBeaconStateMachine(Configurable, ABC):
     state_transition_class = None  # type: Type[BaseStateTransition]
 
     @abstractmethod
-    def __init__(self,
-                 chaindb: BaseBeaconChainDB,
-                 block_root: Hash32) -> None:
-        pass
+    def __init__(
+        self,
+        chaindb: BaseBeaconChainDB,
+        attestation_pool: AttestationPool,
+        slot: Slot,
+        state: BeaconState = None,
+    ) -> None:
+        ...
 
     @classmethod
     @abstractmethod
     def get_block_class(cls) -> Type[BaseBeaconBlock]:
-        pass
+        ...
 
     @classmethod
     @abstractmethod
     def get_state_class(cls) -> Type[BeaconState]:
-        pass
+        ...
 
     @classmethod
     @abstractmethod
     def get_state_transiton_class(cls) -> Type[BaseStateTransition]:
-        pass
+        ...
 
     @property
     @abstractmethod
     def state_transition(self) -> BaseStateTransition:
-        pass
+        ...
+
+    @abstractmethod
+    def get_fork_choice_scoring(self) -> ForkChoiceScoringFn:
+        ...
 
     #
     # Import block API
     #
     @abstractmethod
-    def import_block(self,
-                     block: BaseBeaconBlock,
-                     check_proposer_signature: bool=True) -> Tuple[BeaconState, BaseBeaconBlock]:
-        pass
+    def import_block(
+        self,
+        block: BaseBeaconBlock,
+        state: BeaconState,
+        check_proposer_signature: bool = True,
+    ) -> Tuple[BeaconState, BaseBeaconBlock]:
+        ...
 
     @staticmethod
     @abstractmethod
-    def create_block_from_parent(parent_block: BaseBeaconBlock,
-                                 block_params: FromBlockParams) -> BaseBeaconBlock:
-        pass
+    def create_block_from_parent(
+        parent_block: BaseBeaconBlock, block_params: FromBlockParams
+    ) -> BaseBeaconBlock:
+        ...
 
 
 class BeaconStateMachine(BaseBeaconStateMachine):
-    def __init__(self,
-                 chaindb: BaseBeaconChainDB,
-                 block: BaseBeaconBlock) -> None:
+    def __init__(
+        self,
+        chaindb: BaseBeaconChainDB,
+        attestation_pool: AttestationPool,
+        slot: Slot,
+        state: BeaconState = None,
+    ) -> None:
         self.chaindb = chaindb
-        self.block = block
-
-    @property
-    def state(self) -> BeaconState:
-        if self._state is None:
-            self._state = self.chaindb.get_state_by_root(self.block.state_root)
-        return self._state
+        self.attestation_pool = attestation_pool
+        if state is not None:
+            self._state = state
+        else:
+            self.slot = slot
 
     @classmethod
     def get_block_class(cls) -> Type[BaseBeaconBlock]:
@@ -126,7 +124,9 @@ class BeaconStateMachine(BaseBeaconStateMachine):
         class that this StateTransition uses for StateTransition.
         """
         if cls.state_transition_class is None:
-            raise AttributeError("No `state_transition_class` has been set for this StateMachine")
+            raise AttributeError(
+                "No `state_transition_class` has been set for this StateMachine"
+            )
         else:
             return cls.state_transition_class
 
@@ -137,17 +137,16 @@ class BeaconStateMachine(BaseBeaconStateMachine):
     #
     # Import block API
     #
-    def import_block(self,
-                     block: BaseBeaconBlock,
-                     check_proposer_signature: bool=True) -> Tuple[BeaconState, BaseBeaconBlock]:
+    def import_block(
+        self,
+        block: BaseBeaconBlock,
+        state: BeaconState,
+        check_proposer_signature: bool = True,
+    ) -> Tuple[BeaconState, BaseBeaconBlock]:
         state = self.state_transition.apply_state_transition(
-            self.state,
-            block,
-            check_proposer_signature,
+            state, block=block, check_proposer_signature=check_proposer_signature
         )
 
-        block = block.copy(
-            state_root=state.root,
-        )
+        block = block.copy(state_root=state.hash_tree_root)
 
         return state, block

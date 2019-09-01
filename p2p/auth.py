@@ -20,7 +20,7 @@ from eth_hash.auto import keccak
 from cancel_token import CancelToken
 
 from p2p import ecies
-from p2p import kademlia
+from p2p.abc import NodeAPI
 from p2p.constants import REPLY_TIMEOUT
 from p2p.exceptions import (
     BadAckMessage,
@@ -40,12 +40,12 @@ from .constants import (
     HASH_LEN,
     PUBKEY_LEN,
     SIGNATURE_LEN,
-    SUPPORTED_RLPX_VERSION,
+    DEVP2P_V4,
 )
 
 
 async def handshake(
-        remote: kademlia.Node,
+        remote: NodeAPI,
         privkey: datatypes.PrivateKey,
         token: CancelToken) -> Tuple[bytes, bytes, sha3.keccak_256, sha3.keccak_256, asyncio.StreamReader, asyncio.StreamWriter]:  # noqa: E501
     """
@@ -85,6 +85,10 @@ async def _handshake(initiator: 'HandshakeInitiator', reader: asyncio.StreamRead
     initiator_nonce = keccak(os.urandom(HASH_LEN))
     auth_msg = initiator.create_auth_message(initiator_nonce)
     auth_init = initiator.encrypt_auth_message(auth_msg)
+
+    if writer.transport.is_closing():
+        raise HandshakeFailure("Error during handshake with {initiator.remote!r}. Writer closed.")
+
     writer.write(auth_init)
 
     auth_ack = await token.cancellable_wait(
@@ -94,7 +98,7 @@ async def _handshake(initiator: 'HandshakeInitiator', reader: asyncio.StreamRead
     if reader.at_eof():
         # This is what happens when Parity nodes have blacklisted us
         # (https://github.com/ethereum/py-evm/issues/901).
-        raise HandshakeFailure("%s disconnected before sending auth ack", repr(initiator.remote))
+        raise HandshakeFailure(f"{initiator.remote!r} disconnected before sending auth ack")
 
     ephemeral_pubkey, responder_nonce = initiator.decode_auth_ack_message(auth_ack)
     aes_secret, mac_secret, egress_mac, ingress_mac = initiator.derive_secrets(
@@ -113,7 +117,7 @@ class HandshakeBase:
     _is_initiator = False
 
     def __init__(
-            self, remote: kademlia.Node, privkey: datatypes.PrivateKey,
+            self, remote: NodeAPI, privkey: datatypes.PrivateKey,
             use_eip8: bool, token: CancelToken) -> None:
         self.remote = remote
         self.privkey = privkey
@@ -191,7 +195,7 @@ class HandshakeInitiator(HandshakeBase):
 
         if self.use_eip8:
             data = rlp.encode(
-                [S, self.pubkey.to_bytes(), nonce, SUPPORTED_RLPX_VERSION], sedes=eip8_auth_sedes)
+                [S, self.pubkey.to_bytes(), nonce, DEVP2P_V4], sedes=eip8_auth_sedes)
             return _pad_eip8_data(data)
         else:
             # S || H(ephemeral-pubk) || pubk || nonce || 0x0
@@ -218,7 +222,7 @@ class HandshakeResponder(HandshakeBase):
     def create_auth_ack_message(self, nonce: bytes) -> bytes:
         if self.use_eip8:
             data = rlp.encode(
-                (self.ephemeral_pubkey.to_bytes(), nonce, SUPPORTED_RLPX_VERSION),
+                (self.ephemeral_pubkey.to_bytes(), nonce, DEVP2P_V4),
                 sedes=eip8_ack_sedes)
             msg = _pad_eip8_data(data)
         else:
@@ -275,7 +279,7 @@ def decode_ack_plain(
         raise BadAckMessage(f"Unexpected size for ack message: {len(message)}")
     eph_pubkey = keys.PublicKey(message[:PUBKEY_LEN])
     nonce = message[PUBKEY_LEN: PUBKEY_LEN + HASH_LEN]
-    return eph_pubkey, nonce, SUPPORTED_RLPX_VERSION
+    return eph_pubkey, nonce, DEVP2P_V4
 
 
 def decode_ack_eip8(
@@ -304,7 +308,7 @@ def decode_auth_plain(ciphertext: bytes, privkey: datatypes.PrivateKey) -> Tuple
     pubkey = keys.PublicKey(message[pubkey_start: pubkey_start + PUBKEY_LEN])
     nonce_start = pubkey_start + PUBKEY_LEN
     nonce = message[nonce_start: nonce_start + HASH_LEN]
-    return signature, pubkey, nonce, SUPPORTED_RLPX_VERSION
+    return signature, pubkey, nonce, DEVP2P_V4
 
 
 def decode_auth_eip8(ciphertext: bytes, privkey: datatypes.PrivateKey) -> Tuple[

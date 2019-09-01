@@ -7,9 +7,7 @@ from typing import (
 )
 
 
-from p2p.protocol import (
-    BaseRequest,
-)
+from p2p.abc import RequestAPI
 
 from trinity._utils.ema import EMA
 from trinity._utils.logging import HasExtendedDebugLogger
@@ -20,11 +18,13 @@ from .types import (
     TResult,
 )
 
+TRequest = TypeVar('TRequest', bound=RequestAPI[Any])
 
-TRequest = TypeVar('TRequest', bound=BaseRequest[Any])
 
-
-class BasePerformanceTracker(ABC, HasExtendedDebugLogger, Generic[TRequest, TResult]):
+class BasePerformance(ABC):
+    """
+    The statistics of how a command is performing.
+    """
     def __init__(self) -> None:
         self.total_msgs = 0
         self.total_items = 0
@@ -44,35 +44,6 @@ class BasePerformanceTracker(ABC, HasExtendedDebugLogger, Generic[TRequest, TRes
 
         # an EMA of the items per second
         self.items_per_second_ema = EMA(initial_value=0, smoothing_factor=0.05)
-
-    @abstractmethod
-    def _get_request_size(self, request: TRequest) -> Optional[int]:
-        """
-        The request size represents the number of *things* that were requested,
-        not taking into account the sizes of individual items.
-
-        Some requests cannot be used to determine the expected size.  In this
-        case `None` should be returned.  (Specifically the `GetBlockHeaders`
-        anchored to a block hash.
-        """
-        pass
-
-    @abstractmethod
-    def _get_result_size(self, result: TResult) -> int:
-        """
-        The result size represents the number of *things* that were returned,
-        not taking into account the sizes of individual items.
-        """
-        pass
-
-    @abstractmethod
-    def _get_result_item_count(self, result: TResult) -> int:
-        """
-        The item count is intended to more accurately represent the size of the
-        response, taking into account things like the size of individual
-        response items such as the number of transactions in a block.
-        """
-        pass
 
     def get_stats(self) -> str:
         """
@@ -99,23 +70,53 @@ class BasePerformanceTracker(ABC, HasExtendedDebugLogger, Generic[TRequest, TRes
         # missing: total number of missing response items
         # quality: 0-100 for how complete responses are
         return (
-            'msgs=%d  items=%d  rtt=%.2f/%.2f/%.2f  ips=%.5f  '
-            'timeouts=%d  quality=%d'
-        ) % (
-            self.total_msgs,
-            self.total_items,
-            self.round_trip_ema.value,
-            rt99,
-            rt_stddev,
-            self.items_per_second_ema.value,
-            self.total_timeouts,
-            int(self.response_quality_ema.value),
+            f"msgs={self.total_msgs}  items={self.total_items}  "
+            f"rtt={self.round_trip_ema.value:.2f}/{rt99:.2f}/{rt_stddev:.2f}  "
+            f"ips={self.items_per_second_ema.value:.5f}  "
+            f"timeouts={self.total_timeouts}  quality={int(self.response_quality_ema.value)}"
         )
 
-    def record_timeout(self) -> None:
+
+class BasePerformanceTracker(BasePerformance, HasExtendedDebugLogger, Generic[TRequest, TResult]):
+    def __init__(self) -> None:
+        super().__init__()
+
+    @abstractmethod
+    def _get_request_size(self, request: TRequest) -> Optional[int]:
+        """
+        The request size represents the number of *things* that were requested,
+        not taking into account the sizes of individual items.
+
+        Some requests cannot be used to determine the expected size.  In this
+        case `None` should be returned.  (Specifically the `GetBlockHeaders`
+        anchored to a block hash.
+        """
+        ...
+
+    @abstractmethod
+    def _get_result_size(self, result: TResult) -> int:
+        """
+        The result size represents the number of *things* that were returned,
+        not taking into account the sizes of individual items.
+        """
+        ...
+
+    @abstractmethod
+    def _get_result_item_count(self, result: TResult) -> int:
+        """
+        The item count is intended to more accurately represent the size of the
+        response, taking into account things like the size of individual
+        response items such as the number of transactions in a block.
+        """
+        ...
+
+    def record_timeout(self, timeout: float) -> None:
         self.total_msgs += 1
         self.total_timeouts += 1
         self.response_quality_ema.update(0)
+        self.round_trip_ema.update(timeout)
+        self.round_trip_99th.update(timeout)
+        self.round_trip_stddev.update(timeout)
         self.items_per_second_ema.update(0)
 
     def record_response(self,

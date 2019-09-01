@@ -1,22 +1,25 @@
-from eth.constants import (
-    ZERO_HASH32,
-)
+from eth.constants import ZERO_HASH32
+from eth_typing import BLSPubkey, BLSSignature
 
-from eth2.beacon.typing import (
-    BLSSignature,
-    Epoch
-)
+from eth2.beacon.typing import Epoch, Timestamp
 
-
-EMPTY_SIGNATURE = BLSSignature(b'\x00' * 96)
-GWEI_PER_ETH = 10**9
-FAR_FUTURE_EPOCH = Epoch(2**64 - 1)
+EMPTY_SIGNATURE = BLSSignature(b"\x00" * 96)
+EMPTY_PUBKEY = BLSPubkey(b"\x00" * 48)
+GWEI_PER_ETH = 10 ** 9
+FAR_FUTURE_EPOCH = Epoch(2 ** 64 - 1)
 
 GENESIS_PARENT_ROOT = ZERO_HASH32
 
-#
-# shuffle function
-#
+ZERO_TIMESTAMP = Timestamp(0)
 
-POWER_OF_TWO_NUMBERS = [1, 2, 4, 8, 16, 32, 64, 128]
-MAX_LIST_SIZE = 2**40
+MAX_INDEX_COUNT = 2 ** 40
+
+MAX_RANDOM_BYTE = 2 ** 8 - 1
+
+BASE_REWARDS_PER_EPOCH = 5
+
+DEPOSIT_CONTRACT_TREE_DEPTH = 2 ** 5
+
+SECONDS_PER_DAY = 86400
+
+JUSTIFICATION_BITS_LENGTH = 4

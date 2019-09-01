@@ -3,6 +3,8 @@ from typing import (
     Type,
 )
 
+from lahja import EndpointAPI
+
 from eth_keys.datatypes import PrivateKey
 from eth_utils import (
     ValidationError,
@@ -16,14 +18,21 @@ from trinity.chains.light import (
 from trinity.config import (
     TrinityConfig,
 )
-from trinity.endpoint import TrinityEventBusEndpoint
+from trinity.db.eth1.chain import AsyncChainDB
 from trinity.nodes.base import Node
-from trinity.protocol.les.peer import LESPeerPool
+from trinity.protocol.common.peer_pool_event_bus import (
+    PeerPoolEventServer,
+)
+from trinity.protocol.les.peer import (
+    LESPeer,
+    LESPeerPool,
+    LESPeerPoolEventServer,
+)
 from trinity.server import LightServer
 from trinity.sync.light.service import LightPeerChain
 
 
-class LightNode(Node):
+class LightNode(Node[LESPeer]):
     _chain: LightDispatchChain = None
     _peer_chain: LightPeerChain = None
     _p2p_server: LightServer = None
@@ -31,7 +40,7 @@ class LightNode(Node):
     network_id: int = None
     nodekey: PrivateKey = None
 
-    def __init__(self, event_bus: TrinityEventBusEndpoint, trinity_config: TrinityConfig) -> None:
+    def __init__(self, event_bus: EndpointAPI, trinity_config: TrinityConfig) -> None:
         super().__init__(event_bus, trinity_config)
 
         self._nodekey = trinity_config.nodekey
@@ -65,16 +74,25 @@ class LightNode(Node):
 
         return self._chain
 
+    def get_event_server(self) -> PeerPoolEventServer[LESPeer]:
+        if self._event_server is None:
+            self._event_server = LESPeerPoolEventServer(
+                self.event_bus,
+                self.get_peer_pool(),
+                self.cancel_token,
+                self._peer_chain
+            )
+        return self._event_server
+
     def get_p2p_server(self) -> LightServer:
         if self._p2p_server is None:
-            manager = self.db_manager
             self._p2p_server = LightServer(
                 privkey=self._nodekey,
                 port=self._port,
                 chain=self.get_full_chain(),
-                chaindb=manager.get_chaindb(),  # type: ignore
+                chaindb=AsyncChainDB(self._base_db),
                 headerdb=self.headerdb,
-                base_db=manager.get_db(),  # type: ignore
+                base_db=self._base_db,
                 network_id=self._network_id,
                 max_peers=self._max_peers,
                 bootstrap_nodes=self._bootstrap_nodes,

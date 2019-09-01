@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from eth_utils import (
@@ -10,16 +12,21 @@ from cancel_token import CancelToken
 
 from p2p import ecies
 from p2p import kademlia
-from p2p.p2p_proto import Hello
 from p2p.auth import (
     HandshakeInitiator,
     HandshakeResponder,
 )
 from p2p.auth import decode_authentication
-from p2p.peer import PeerConnection
-from p2p.tools.paragon import (
-    ParagonPeer,
-    ParagonContext,
+from p2p.constants import DEVP2P_V5, DEVP2P_V4
+from p2p.p2p_proto import (
+    Hello,
+    P2PProtocol,
+    P2PProtocolV4,
+)
+from p2p.multiplexer import Multiplexer
+from p2p.transport import Transport
+
+from p2p.tools.asyncio_streams import (
     get_directly_connected_streams,
 )
 
@@ -110,7 +117,11 @@ async def test_handshake():
         (initiator_reader, initiator_writer),
     ) = get_directly_connected_streams()
 
-    initiator_connection = PeerConnection(
+    capabilities = (('paragon', 1),)
+
+    initiator_transport = Transport(
+        remote=initiator_remote,
+        private_key=initiator.privkey,
         reader=initiator_reader,
         writer=initiator_writer,
         aes_secret=initiator_aes_secret,
@@ -118,14 +129,19 @@ async def test_handshake():
         egress_mac=initiator_egress_mac,
         ingress_mac=initiator_ingress_mac
     )
-    initiator_peer = ParagonPeer(
-        remote=initiator.remote,
-        privkey=initiator.privkey,
-        connection=initiator_connection,
-        context=ParagonContext(),
+    initiator_p2p_protocol = P2PProtocol(initiator_transport, 0, False)
+    initiator_multiplexer = Multiplexer(
+        transport=initiator_transport,
+        base_protocol=initiator_p2p_protocol,
+        protocols=(),
     )
-    initiator_peer.base_protocol.send_handshake()
-    responder_connection = PeerConnection(
+    initiator_multiplexer.get_base_protocol().send_handshake(
+        'initiator', capabilities, 30303, DEVP2P_V5,
+    )
+
+    responder_transport = Transport(
+        remote=responder_remote,
+        private_key=responder.privkey,
         reader=responder_reader,
         writer=responder_writer,
         aes_secret=aes_secret,
@@ -133,18 +149,30 @@ async def test_handshake():
         egress_mac=egress_mac,
         ingress_mac=ingress_mac,
     )
-    responder_peer = ParagonPeer(
-        remote=responder.remote,
-        privkey=responder.privkey,
-        connection=responder_connection,
-        context=ParagonContext(),
+    responder_p2p_protocol = P2PProtocol(responder_transport, 0, False)
+    responder_multiplexer = Multiplexer(
+        transport=responder_transport,
+        base_protocol=responder_p2p_protocol,
+        protocols=(),
     )
-    responder_peer.base_protocol.send_handshake()
+    responder_multiplexer.get_base_protocol().send_handshake(
+        'responder', capabilities, 30303, DEVP2P_V5,
+    )
 
-    # The handshake msgs sent by each peer (above) are going to be fed directly into their remote's
-    # reader, and thus the read_msg() calls will return immediately.
-    responder_hello, _ = await responder_peer.read_msg()
-    initiator_hello, _ = await initiator_peer.read_msg()
+    async with initiator_multiplexer.multiplex():
+        async with responder_multiplexer.multiplex():
+            initiator_stream = initiator_multiplexer.stream_protocol_messages(
+                initiator_p2p_protocol,
+            )
+            responder_stream = responder_multiplexer.stream_protocol_messages(
+                responder_p2p_protocol,
+            )
+
+            initiator_hello, _ = await asyncio.wait_for(initiator_stream.asend(None), timeout=0.1)
+            responder_hello, _ = await asyncio.wait_for(responder_stream.asend(None), timeout=0.1)
+
+            await initiator_stream.aclose()
+            await responder_stream.aclose()
 
     assert isinstance(responder_hello, Hello)
     assert isinstance(initiator_hello, Hello)
@@ -220,7 +248,11 @@ async def test_handshake_eip8():
         (initiator_reader, initiator_writer),
     ) = get_directly_connected_streams()
 
-    initiator_connection = PeerConnection(
+    capabilities = (('testing', 1),)
+
+    initiator_transport = Transport(
+        remote=initiator_remote,
+        private_key=initiator.privkey,
         reader=initiator_reader,
         writer=initiator_writer,
         aes_secret=initiator_aes_secret,
@@ -228,14 +260,19 @@ async def test_handshake_eip8():
         egress_mac=initiator_egress_mac,
         ingress_mac=initiator_ingress_mac
     )
-    initiator_peer = ParagonPeer(
-        remote=initiator.remote,
-        privkey=initiator.privkey,
-        connection=initiator_connection,
-        context=ParagonContext(),
+    initiator_p2p_protocol = P2PProtocol(initiator_transport, 0, False)
+    initiator_multiplexer = Multiplexer(
+        transport=initiator_transport,
+        base_protocol=initiator_p2p_protocol,
+        protocols=(),
     )
-    initiator_peer.base_protocol.send_handshake()
-    responder_connection = PeerConnection(
+    initiator_multiplexer.get_base_protocol().send_handshake(
+        'initiator', capabilities, 30303, DEVP2P_V5,
+    )
+
+    responder_transport = Transport(
+        remote=responder_remote,
+        private_key=responder.privkey,
         reader=responder_reader,
         writer=responder_writer,
         aes_secret=aes_secret,
@@ -243,18 +280,30 @@ async def test_handshake_eip8():
         egress_mac=egress_mac,
         ingress_mac=ingress_mac,
     )
-    responder_peer = ParagonPeer(
-        remote=responder.remote,
-        privkey=responder.privkey,
-        connection=responder_connection,
-        context=ParagonContext(),
+    responder_p2p_protocol = P2PProtocolV4(responder_transport, 0, False)
+    responder_multiplexer = Multiplexer(
+        transport=responder_transport,
+        base_protocol=responder_p2p_protocol,
+        protocols=(),
     )
-    responder_peer.base_protocol.send_handshake()
+    responder_multiplexer.get_base_protocol().send_handshake(
+        'responder', capabilities, 30303, DEVP2P_V4,
+    )
 
-    # The handshake msgs sent by each peer (above) are going to be fed directly into their remote's
-    # reader, and thus the read_msg() calls will return immediately.
-    responder_hello, _ = await responder_peer.read_msg()
-    initiator_hello, _ = await initiator_peer.read_msg()
+    async with initiator_multiplexer.multiplex():
+        async with responder_multiplexer.multiplex():
+            initiator_stream = initiator_multiplexer.stream_protocol_messages(
+                initiator_p2p_protocol,
+            )
+            responder_stream = responder_multiplexer.stream_protocol_messages(
+                responder_p2p_protocol,
+            )
+
+            initiator_hello, _ = await initiator_stream.asend(None)
+            responder_hello, _ = await responder_stream.asend(None)
+
+            await initiator_stream.aclose()
+            await responder_stream.aclose()
 
     assert isinstance(responder_hello, Hello)
     assert isinstance(initiator_hello, Hello)

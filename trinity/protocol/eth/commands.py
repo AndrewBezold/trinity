@@ -1,5 +1,4 @@
 from typing import (
-    cast,
     Tuple,
 )
 
@@ -9,30 +8,31 @@ from eth.rlp.headers import BlockHeader
 from eth.rlp.receipts import Receipt
 from eth.rlp.transactions import BaseTransactionFields
 
-from p2p.protocol import (
-    Command,
-    _DecodedMsgType,
-)
+from p2p.protocol import Command
+from p2p.typing import Payload
 
 from trinity.protocol.common.commands import BaseBlockHeaders
 from trinity.rlp.block_body import BlockBody
 from trinity.rlp.sedes import HashOrNumber
 
 
+hash_sedes = sedes.Binary(min_length=32, max_length=32)
+
+
 class Status(Command):
     _cmd_id = 0
-    structure = [
+    structure = (
         ('protocol_version', sedes.big_endian_int),
         ('network_id', sedes.big_endian_int),
         ('td', sedes.big_endian_int),
-        ('best_hash', sedes.binary),
-        ('genesis_hash', sedes.binary),
-    ]
+        ('best_hash', hash_sedes),
+        ('genesis_hash', hash_sedes),
+    )
 
 
 class NewBlockHashes(Command):
     _cmd_id = 1
-    structure = sedes.CountableList(sedes.List([sedes.binary, sedes.big_endian_int]))
+    structure = sedes.CountableList(sedes.List([hash_sedes, sedes.big_endian_int]))
 
 
 class Transactions(Command):
@@ -42,20 +42,20 @@ class Transactions(Command):
 
 class GetBlockHeaders(Command):
     _cmd_id = 3
-    structure = [
+    structure = (
         ('block_number_or_hash', HashOrNumber()),
         ('max_headers', sedes.big_endian_int),
         ('skip', sedes.big_endian_int),
         ('reverse', sedes.boolean),
-    ]
+    )
 
 
 class BlockHeaders(BaseBlockHeaders):
     _cmd_id = 4
     structure = sedes.CountableList(BlockHeader)
 
-    def extract_headers(self, msg: _DecodedMsgType) -> Tuple[BlockHeader, ...]:
-        return cast(Tuple[BlockHeader, ...], tuple(msg))
+    def extract_headers(self, msg: Payload) -> Tuple[BlockHeader, ...]:
+        return tuple(msg)
 
 
 class GetBlockBodies(Command):
@@ -70,16 +70,17 @@ class BlockBodies(Command):
 
 class NewBlock(Command):
     _cmd_id = 7
-    structure = [
+    structure = (
         ('block', sedes.List([BlockHeader,
                               sedes.CountableList(BaseTransactionFields),
                               sedes.CountableList(BlockHeader)])),
-        ('total_difficulty', sedes.big_endian_int)]
+        ('total_difficulty', sedes.big_endian_int),
+    )
 
 
 class GetNodeData(Command):
     _cmd_id = 13
-    structure = sedes.CountableList(sedes.binary)
+    structure = sedes.CountableList(hash_sedes)
 
 
 class NodeData(Command):
@@ -89,7 +90,7 @@ class NodeData(Command):
 
 class GetReceipts(Command):
     _cmd_id = 15
-    structure = sedes.CountableList(sedes.binary)
+    structure = sedes.CountableList(hash_sedes)
 
 
 class Receipts(Command):

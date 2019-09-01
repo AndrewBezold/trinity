@@ -27,7 +27,7 @@ class BaseExchangeHandler(ABC):
     @property
     @abstractmethod
     def _exchange_config(self) -> Dict[str, Type[BaseExchange[Any, Any, Any]]]:
-        pass
+        ...
 
     def __init__(self, peer: BasePeer) -> None:
         self._peer = peer
@@ -61,9 +61,10 @@ if TYPE_CHECKING:
         [
             BaseExchangeHandler,
             BlockIdentifier,
-            int,
+            DefaultArg(int, 'max_headers'),
             DefaultArg(int, 'skip'),
-            DefaultArg(int, 'reverse')
+            DefaultArg(int, 'reverse'),
+            DefaultArg(float, 'timeout')
         ],
         Awaitable[Tuple[BlockHeader, ...]]
     ]

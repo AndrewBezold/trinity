@@ -24,23 +24,16 @@ class PeerConnectionLost(BaseP2PError):
     pass
 
 
+class IneligiblePeer(BaseP2PError):
+    """
+    Raised when a peer is not a valid connection candidate.
+    """
+    pass
+
+
 class HandshakeFailure(BaseP2PError):
     """
     Raised when the protocol handshake was unsuccessful.
-    """
-    pass
-
-
-class WrongNetworkFailure(HandshakeFailure):
-    """
-    Disconnected from the peer because it's on a different network than we're on
-    """
-    pass
-
-
-class WrongGenesisFailure(HandshakeFailure):
-    """
-    Disconnected from the peer because it has a different genesis than we do
     """
     pass
 
@@ -55,6 +48,14 @@ class TooManyPeersFailure(HandshakeFailure):
 class MalformedMessage(BaseP2PError):
     """
     Raised when a p2p command is received with a malformed message
+    """
+    pass
+
+
+class UnknownProtocol(BaseP2PError):
+    """
+    Raised in cases where a given protocol is not present such as not part of a
+    Multiplexer connection.
     """
     pass
 
@@ -97,20 +98,6 @@ class LESAnnouncementProcessingError(BaseP2PError):
 class TooManyTimeouts(BaseP2PError):
     """
     Raised when too many timeouts occurred.
-    """
-    pass
-
-
-class NoMatchingPeerCapabilities(BaseP2PError):
-    """
-    Raised when no matching protocol between peers was found.
-    """
-    pass
-
-
-class RemoteDisconnected(BaseP2PError):
-    """
-    Raised when a remote disconnected.
     """
     pass
 
@@ -171,8 +158,8 @@ class NoInternalAddressMatchesDevice(BaseP2PError):
     """
     Raised when no internal IP address matches the UPnP device that is being configured.
     """
-    def __init__(self, *args: Any, device_hostname: str=None, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args: Any, device_hostname: str=None) -> None:
+        super().__init__(*args)
         self.device_hostname = device_hostname
 
 
@@ -190,8 +177,7 @@ class UnableToGetDiscV5Ticket(BaseP2PError):
     pass
 
 
-class BadDatabaseError(BaseP2PError):
+class NoMatchingPeerCapabilities(BaseP2PError):
     """
-    The local database wasn't in quite the format we were expecting
+    Raised during primary p2p handshake if there are no common capabilities with a peer.
     """
-    pass

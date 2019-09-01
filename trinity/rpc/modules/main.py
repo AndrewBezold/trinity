@@ -1,24 +1,18 @@
 from abc import (
-    abstractmethod,
     ABC,
 )
 from typing import (
     Any,
     Generic,
     TypeVar,
-    TYPE_CHECKING,
 )
 
 from lahja import (
     BaseEvent,
+    EndpointAPI
 )
 
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
-
-if TYPE_CHECKING:
-    from trinity.chains.base import BaseAsyncChain  # noqa: F401
+from trinity.chains.base import AsyncChainAPI
 
 
 TChain = TypeVar('TChain')
@@ -33,14 +27,16 @@ class ChainReplacementEvent(BaseEvent, Generic[TChain]):
 class BaseRPCModule(ABC):
 
     @property
-    @abstractmethod
     def name(self) -> str:
-        pass
+        # By default the name is the lower-case class name.
+        # This encourages a standard name of the module, but can
+        # be overridden if necessary.
+        return self.__class__.__name__.lower()
 
 
 class ChainBasedRPCModule(BaseRPCModule, Generic[TChain]):
 
-    def __init__(self, chain: TChain, event_bus: TrinityEventBusEndpoint) -> None:
+    def __init__(self, chain: TChain, event_bus: EndpointAPI) -> None:
         self.chain = chain
         self.event_bus = event_bus
 
@@ -53,5 +49,5 @@ class ChainBasedRPCModule(BaseRPCModule, Generic[TChain]):
         self.chain = chain
 
 
-Eth1ChainRPCModule = ChainBasedRPCModule['BaseAsyncChain']
+Eth1ChainRPCModule = ChainBasedRPCModule[AsyncChainAPI]
 BeaconChainRPCModule = ChainBasedRPCModule[Any]

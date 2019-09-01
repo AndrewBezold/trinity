@@ -10,7 +10,7 @@ First we need to clone the Py-EVM repository. Py-EVM depends on a submodule of t
 
 .. code:: sh
 
-    $ git clone --recursive https://github.com/ethereum/py-evm.git
+    $ git clone --recursive https://github.com/ethereum/trinity.git
 
 
 
@@ -65,7 +65,7 @@ All parameters as well as the return type of defs are expected to be typed with 
 
 .. code:: python
 
-    def __init__(self, wrapped_db: BaseDB) -> None:
+    def __init__(self, wrapped_db: DatabaseAPI) -> None:
         self.wrapped_db = wrapped_db
         self.reset()
 
@@ -90,8 +90,8 @@ GitHub interface and make sure all tests are passing. In general pull requests t
 do not pass the CI build yet won't get reviewed unless explicitly requested.
 
 If the pull request introduces changes that should be reflected in the release notes,
-please add a line to the *Unreleased (from source)* section of the
-`release_notes file<https://github.com/ethereum/trinity/blob/master/docs/release_notes/trinity.rst>_`
+please add a `newsfragment` file as explained
+`here<https://github.com/ethereum/trinity/blob/master/newsfragments/README.md>_`
 
 If possible, the change to the release notes file should be included in the commit that introduces the
 feature or bugfix.
@@ -136,6 +136,9 @@ Before releasing a new version, build and test the package that will be released
     # smoke test the release
     trinity --ropsten
 
+    # Preview the upcoming release notes
+    towncrier --draft
+
 Push the release to github & pypi
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -144,10 +147,6 @@ After confirming that the release package looks okay, release a new version:
 .. code:: sh
 
     make release bump=$$VERSION_PART_TO_BUMP$$
-
-    # While trinity and py-evm are colocated,
-    # manually change trinity & py-evm version in setup_trinity.py
-    make release-trinity
 
 Which version part to bump
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

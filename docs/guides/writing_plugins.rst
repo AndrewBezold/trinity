@@ -79,27 +79,7 @@ This is the default type of plugin we want to build if:
   runtime (as opposed to e.g. just reading things from the database)
 
 We build this kind of plugin subclassing from
-:class:`~trinity.extensibility.plugin.BaseIsolatedPlugin`.  A detailed example will follow soon.
-
-
-Plugins that run inside the networking process
-----------------------------------------------
-
-If the previous category sounded as if it could handle every possible use case, it's because it's
-actually meant to. In reality though, not all internal APIs yet work well across process
-boundaries. In practice, this means that sometimes we want to make sure that a plugin runs in the
-same process as the rest of the networking code.
-
-.. warning::
-  The need to run plugins in the networking process is declining as the internals of Trinity become
-  more and more multi-process friendly over time. While it isn't entirely clear yet, there's a fair
-  chance this type of plugin will become obsolete at some point and may eventually be removed.
-
-  We should only choose this type of plugin category if what we are trying to build cannot be built
-  with a :class:`~trinity.extensibility.plugin.BaseIsolatedPlugin`.
-
-We build this kind of plugin subclassing from
-:class:`~trinity.extensibility.plugin.BaseAsyncStopPlugin`.  A detailed example will follow soon.
+:class:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin`.  A detailed example will follow soon.
 
 
 The plugin lifecycle
@@ -134,13 +114,12 @@ was called which happens as soon as the core infrastructure of Trinity is ready.
 Plugin state: ``READY``
 -----------------------
 
-After Trinity has finished setting up the core infrastructure, every plugin has its
-:class:`~trinity.extensibility.plugin.PluginContext` set and
-:meth:`~trinity.extensibility.plugin.BasePlugin.on_ready` is called. At this point the plugin has
-access to important information such as the parsed arguments or the 
-:class:`~trinity.config.TrinityConfig`. It also has access to the central event bus via its
-:meth:`~trinity.extensibility.plugin.BasePlugin.event_bus` property which enables the plugin to
-communicate with other parts of the application including other plugins.
+After Trinity has finished setting up the core infrastructure,
+:meth:`~trinity.extensibility.plugin.BasePlugin.on_ready` is called on each plugin. At
+this point the plugin has access to important information such as the parsed arguments or
+the :class:`~trinity.config.TrinityConfig`. It also has access to the central event bus
+via its :meth:`~trinity.extensibility.plugin.BasePlugin.event_bus` property which enables
+the plugin to communicate with other parts of the application including other plugins.
 
 Plugin state: ``STARTED``
 -------------------------
@@ -166,10 +145,9 @@ Defining plugins
 ~~~~~~~~~~~~~~~~
 
 We define a plugin by deriving from either
-:class:`~trinity.extensibility.plugin.BaseMainProcessPlugin`,
-:class:`~trinity.extensibility.plugin.BaseIsolatedPlugin` or 
-:class:`~trinity.extensibility.plugin.BaseAsyncStopPlugin` depending on the kind of plugin that we
-intend to write. For now, we'll stick to :class:`~trinity.extensibility.plugin.BaseIsolatedPlugin`
+:class:`~trinity.extensibility.plugin.BaseMainProcessPlugin` or
+:class:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin` depending on the kind of plugin that we
+intend to write. For now, we'll stick to :class:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin`
 which is the most commonly used plugin category.
 
 Every plugin needs to overwrite ``name`` so voilà, here's our first plugin!
@@ -240,7 +218,7 @@ service.
    :language: python
    :pyobject: PeerCountReporter
 
-Then, the implementation of :meth:`~trinity.extensibility.plugin.BaseIsolatedPlugin.do_start` is
+Then, the implementation of :meth:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin.do_start` is
 only concerned about running the service on a fresh event loop.
 
 .. literalinclude:: ../../trinity-external-plugins/examples/peer_count_reporter/peer_count_reporter_plugin/plugin.py
@@ -274,10 +252,10 @@ is started with the ``--report-peer-count`` flag.
    :language: python
    :pyobject: PeerCountReporterPlugin.on_ready
 
-In case of a :class:`~trinity.extensibility.plugin.BaseIsolatedPlugin`, this will cause the
-:meth:`~trinity.extensibility.plugin.BaseIsolatedPlugin.do_start` method to run on an entirely
+In case of a :class:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin`, this will cause the
+:meth:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin.do_start` method to run on an entirely
 separated, new process. In other cases
-:meth:`~trinity.extensibility.plugin.BaseIsolatedPlugin.do_start` will simply run in the same
+:meth:`~trinity.extensibility.asyncio.AsyncioIsolatedPlugin.do_start` will simply run in the same
 process as the plugin manager that the plugin is controlled by.
 
 

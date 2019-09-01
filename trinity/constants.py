@@ -31,9 +31,11 @@ PID_DIR = 'pids'
 SYNC_FULL = 'full'
 SYNC_FAST = 'fast'
 SYNC_LIGHT = 'light'
+SYNC_BEAM = 'beam'
 
 # lahja endpoint names
 MAIN_EVENTBUS_ENDPOINT = 'main'
+NETWORKDB_EVENTBUS_ENDPOINT = 'network-db'
 NETWORKING_EVENTBUS_ENDPOINT = 'networking'
 TO_NETWORKING_BROADCAST_CONFIG = BroadcastConfig(filter_endpoint=NETWORKING_EVENTBUS_ENDPOINT)
 
@@ -81,3 +83,9 @@ DEFAULT_PREFERRED_NODES: Dict[int, Tuple[Node, ...]] = {
              Address("34.198.237.7", 30303, 30303)),
     ),
 }
+
+# Amount of time a peer will be blacklisted if their network or genesis hash does not match
+BLACKLIST_SECONDS_WRONG_NETWORK_OR_GENESIS = 600
+
+# Enables connection when clients launch from another process on the shell
+AUTH_KEY = b"not secure, but only connect over IPC"

@@ -1,7 +1,6 @@
-SUPPORTED_RLPX_VERSION = 4
-
-# The p2p protocol version from which Snappy Compression is Enabled
-SNAPPY_PROTOCOL_VERSION = 5
+# DEVP2P Protocol versions
+DEVP2P_V4 = 4
+DEVP2P_V5 = 5
 
 # Overhead added by ECIES encryption
 ENCRYPT_OVERHEAD_LENGTH = 113
@@ -114,7 +113,60 @@ DEFAULT_PEER_BOOT_TIMEOUT = 20
 
 # Name of the endpoint that the discovery uses to connect to the eventbus
 DISCOVERY_EVENTBUS_ENDPOINT = 'discovery'
-# Interval at which peer pool is checked for potential new candidates
-DISOVERY_INTERVAL = 2
+# Interval at which peer pool requests new connection candidates
+PEER_CONNECT_INTERVAL = 2
+
+# Maximum number of sequential connection attempts that can be made before
+# hitting the rate limit
+MAX_SEQUENTIAL_PEER_CONNECT = 5
+
 # Timeout used when fetching peer candidates from discovery
-REQUEST_PEER_CANDIDATE_TIMEOUT = 0.5
+REQUEST_PEER_CANDIDATE_TIMEOUT = 1
+
+# The maximum number of concurrent attempts to establis new peer connections
+MAX_CONCURRENT_CONNECTION_ATTEMPTS = 10
+
+# Amount of time a peer will be blacklisted when they are disconnected as
+# `DisconnectReason.bad_protocol`
+BLACKLIST_SECONDS_BAD_PROTOCOL = 60 * 10  # 10 minutes
+
+# Amount of time a peer will be blacklisted when they timeout too frequently
+BLACKLIST_SECONDS_TOO_MANY_TIMEOUTS = 60 * 5  # 5 minutes
+
+# Both the amount of time that we consider to be a peer disconnecting from us
+# too quickly as well as the amount of time they will be blacklisted for doing
+# so.
+BLACKLIST_SECONDS_QUICK_DISCONNECT = 60
+
+#
+# Kademlia Constants
+#
+
+# number of bits per hop
+KADEMLIA_BITS_PER_HOP = 8
+
+# bucket size for kademlia routing table
+KADEMLIA_BUCKET_SIZE = 16
+
+# round trip message timout
+KADEMLIA_REQUEST_TIMEOUT = 7.2
+
+# Amount of time to consider a bucket idle
+KADEMLIA_IDLE_BUCKET_REFRESH_INTERVAL = 3600
+
+# Number of parallele `find_node` lookups that can be in progress
+KADEMLIA_FIND_CONCURRENCY = 3
+
+# Size of public keys in bits
+KADEMLIA_PUBLIC_KEY_SIZE = 512
+
+# Size of a node id in bits
+KADEMLIA_ID_SIZE = 256
+
+# Maximum node `id` for a kademlia node
+KADEMLIA_MAX_NODE_ID = (2 ** KADEMLIA_ID_SIZE) - 1
+
+
+# Reserved command length for the base `p2p` protocol
+# - https://github.com/ethereum/devp2p/blob/master/rlpx.md#message-id-based-multiplexing
+P2P_PROTOCOL_COMMAND_LENGTH = 16

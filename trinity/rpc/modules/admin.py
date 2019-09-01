@@ -1,25 +1,22 @@
+from lahja import EndpointAPI
 
-from p2p.events import ConnectToNodeCommand
+from p2p.kademlia import Node
+from p2p.validation import validate_enode_uri
 
 from trinity.constants import TO_NETWORKING_BROADCAST_CONFIG
-from trinity.endpoint import TrinityEventBusEndpoint
+from trinity.protocol.common.events import ConnectToNodeCommand
 from trinity.rpc.modules import BaseRPCModule
-from trinity._utils.validation import validate_enode_uri
 
 
 class Admin(BaseRPCModule):
 
-    def __init__(self, event_bus: TrinityEventBusEndpoint) -> None:
+    def __init__(self, event_bus: EndpointAPI) -> None:
         self.event_bus = event_bus
 
-    @property
-    def name(self) -> str:
-        return 'admin'
+    async def addPeer(self, uri: str) -> None:
+        validate_enode_uri(uri, require_ip=True)
 
-    async def addPeer(self, node: str) -> None:
-        validate_enode_uri(node, require_ip=True)
-
-        self.event_bus.broadcast(
-            ConnectToNodeCommand(node),
+        await self.event_bus.broadcast(
+            ConnectToNodeCommand(Node.from_uri(uri)),
             TO_NETWORKING_BROADCAST_CONFIG
         )

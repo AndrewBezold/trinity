@@ -27,26 +27,24 @@ from eth_utils import (
     to_wei,
 )
 
+from eth.abc import AccountDatabaseAPI
 from eth.constants import (
     ZERO_ADDRESS,
 )
 from eth.rlp.blocks import (
-    BaseBlock
+    BaseBlock,
 )
 from eth.rlp.headers import (
-    BlockHeader
+    BlockHeader,
 )
 from eth.vm.spoof import (
     SpoofTransaction,
 )
-from eth.vm.state import (
-    BaseAccountDB
-)
 
+from trinity.chains.base import AsyncChainAPI
 from trinity.constants import (
     TO_NETWORKING_BROADCAST_CONFIG,
 )
-from trinity.chains.base import BaseAsyncChain
 from trinity.rpc.format import (
     block_to_dict,
     header_to_dict,
@@ -58,6 +56,7 @@ from trinity.rpc.format import (
 from trinity.rpc.modules import (
     Eth1ChainRPCModule,
 )
+from trinity.rpc.retry import retryable
 from trinity.sync.common.events import (
     SyncingRequest,
 )
@@ -66,36 +65,19 @@ from trinity._utils.validation import (
     validate_transaction_gas_estimation_dict,
 )
 
-
-async def get_header(chain: BaseAsyncChain, at_block: Union[str, int]) -> BlockHeader:
-    if at_block == 'pending':
-        raise NotImplementedError("RPC interface does not support the 'pending' block at this time")
-    elif at_block == 'latest':
-        at_header = chain.get_canonical_head()
-    elif at_block == 'earliest':
-        # TODO find if genesis block can be non-zero. Why does 'earliest' option even exist?
-        block = await chain.coro_get_canonical_block_by_number(BlockNumber(0))
-        at_header = block.header
-    # mypy doesn't have user defined type guards yet
-    # https://github.com/python/mypy/issues/5206
-    elif is_integer(at_block) and at_block >= 0:  # type: ignore
-        block = await chain.coro_get_canonical_block_by_number(BlockNumber(0))
-        at_header = block.header
-    else:
-        raise TypeError("Unrecognized block reference: %r" % at_block)
-
-    return at_header
+from ._util import get_header
 
 
-async def account_db_at_block(chain: BaseAsyncChain,
-                              at_block: Union[str, int],
-                              read_only: bool=True) ->BaseAccountDB:
+async def state_at_block(
+        chain: AsyncChainAPI,
+        at_block: Union[str, int],
+        read_only: bool=True) -> AccountDatabaseAPI:
     at_header = await get_header(chain, at_block)
     vm = chain.get_vm(at_header)
-    return vm.state.account_db
+    return vm.state
 
 
-async def get_block_at_number(chain: BaseAsyncChain, at_block: Union[str, int]) -> BaseBlock:
+async def get_block_at_number(chain: AsyncChainAPI, at_block: Union[str, int]) -> BaseBlock:
     # mypy doesn't have user defined type guards yet
     # https://github.com/python/mypy/issues/5206
     if is_integer(at_block) and at_block >= 0:  # type: ignore
@@ -107,7 +89,7 @@ async def get_block_at_number(chain: BaseAsyncChain, at_block: Union[str, int]) 
 
 
 def dict_to_spoof_transaction(
-        chain: BaseAsyncChain,
+        chain: AsyncChainAPI,
         header: BlockHeader,
         transaction_dict: Dict[str, Any]) -> SpoofTransaction:
     """
@@ -120,7 +102,7 @@ def dict_to_spoof_transaction(
         nonce = txn_dict['nonce']
     else:
         vm = chain.get_vm(header)
-        nonce = vm.state.account_db.get_nonce(sender)
+        nonce = vm.state.get_nonce(sender)
 
     gas_price = txn_dict.get('gasPrice', 0)
     gas = txn_dict.get('gas', header.gas_limit)
@@ -143,10 +125,6 @@ class Eth(Eth1ChainRPCModule):
     Any attribute without an underscore is publicly accessible.
     """
 
-    @property
-    def name(self) -> str:
-        return 'eth'
-
     async def accounts(self) -> List[str]:
         # trinity does not manage accounts for the user
         return []
@@ -155,6 +133,7 @@ class Eth(Eth1ChainRPCModule):
         num = self.chain.get_canonical_head().block_number
         return hex(num)
 
+    @retryable(which_block_arg_name='at_block')
     @format_params(identity, to_int_if_hex)
     async def call(self, txn_dict: Dict[str, Any], at_block: Union[str, int]) -> str:
         header = await get_header(self.chain, at_block)
@@ -168,6 +147,7 @@ class Eth(Eth1ChainRPCModule):
         coinbase_address = ZERO_ADDRESS
         return encode_hex(coinbase_address)
 
+    @retryable(which_block_arg_name='at_block')
     @format_params(identity, to_int_if_hex)
     async def estimateGas(self, txn_dict: Dict[str, Any], at_block: Union[str, int]) -> str:
         header = await get_header(self.chain, at_block)
@@ -179,10 +159,11 @@ class Eth(Eth1ChainRPCModule):
     async def gasPrice(self) -> str:
         return hex(int(os.environ.get('TRINITY_GAS_PRICE', to_wei(1, 'gwei'))))
 
+    @retryable(which_block_arg_name='at_block')
     @format_params(decode_hex, to_int_if_hex)
     async def getBalance(self, address: Address, at_block: Union[str, int]) -> str:
-        account_db = await account_db_at_block(self.chain, at_block)
-        balance = account_db.get_balance(address)
+        state = await state_at_block(self.chain, at_block)
+        balance = state.get_balance(address)
 
         return hex(balance)
 
@@ -210,19 +191,21 @@ class Eth(Eth1ChainRPCModule):
         block = await get_block_at_number(self.chain, at_block)
         return hex(len(block.transactions))
 
+    @retryable(which_block_arg_name='at_block')
     @format_params(decode_hex, to_int_if_hex)
     async def getCode(self, address: Address, at_block: Union[str, int]) -> str:
-        account_db = await account_db_at_block(self.chain, at_block)
-        code = account_db.get_code(address)
+        state = await state_at_block(self.chain, at_block)
+        code = state.get_code(address)
         return encode_hex(code)
 
+    @retryable(which_block_arg_name='at_block')
     @format_params(decode_hex, to_int_if_hex, to_int_if_hex)
     async def getStorageAt(self, address: Address, position: int, at_block: Union[str, int]) -> str:
         if not is_integer(position) or position < 0:
             raise TypeError("Position of storage must be a whole number, but was: %r" % position)
 
-        account_db = await account_db_at_block(self.chain, at_block)
-        stored_val = account_db.get_storage(address, position)
+        state = await state_at_block(self.chain, at_block)
+        stored_val = state.get_storage(address, position)
         return encode_hex(int_to_big_endian(stored_val))
 
     @format_params(decode_hex, to_int_if_hex)
@@ -243,8 +226,8 @@ class Eth(Eth1ChainRPCModule):
 
     @format_params(decode_hex, to_int_if_hex)
     async def getTransactionCount(self, address: Address, at_block: Union[str, int]) -> str:
-        account_db = await account_db_at_block(self.chain, at_block)
-        nonce = account_db.get_nonce(address)
+        state = await state_at_block(self.chain, at_block)
+        nonce = state.get_nonce(address)
         return hex(nonce)
 
     @format_params(decode_hex)

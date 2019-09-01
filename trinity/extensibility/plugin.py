@@ -7,7 +7,6 @@ from argparse import (
     Namespace,
     _SubParsersAction,
 )
-import asyncio
 from enum import (
     auto,
     Enum,
@@ -19,28 +18,18 @@ from multiprocessing import (
 from typing import (
     Any,
     Dict,
-    NamedTuple
+    NamedTuple,
 )
 
-from lahja import (
-    ConnectionConfig,
-)
+from lahja.base import EndpointAPI
 
 from trinity.config import (
     TrinityConfig
 )
-from trinity.constants import (
-    MAIN_EVENTBUS_ENDPOINT,
-)
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
 from trinity.extensibility.events import (
-    BaseEvent,
     PluginStartedEvent,
 )
 from trinity.extensibility.exceptions import (
-    EventBusNotReady,
     InvalidPluginStatus,
 )
 from trinity._utils.mp import (
@@ -52,6 +41,9 @@ from trinity._utils.logging import (
 )
 from trinity._utils.os import (
     friendly_filename_or_url,
+)
+from trinity._utils.profiling import (
+    profiler,
 )
 
 
@@ -71,53 +63,17 @@ class TrinityBootInfo(NamedTuple):
     boot_kwargs: Dict[str, Any] = None
 
 
-class PluginContext:
-    """
-    The :class:`~trinity.extensibility.plugin.PluginContext` holds valuable contextual information
-    and APIs to be used by a plugin. This includes the parsed arguments that were used to launch
-    ``Trinity`` as well as an :class:`~lahja.endpoint.Endpoint` that the plugin can use to connect
-    to the event bus.
-
-    The :class:`~trinity.extensibility.plugin.PluginContext` is set during startup and is
-    guaranteed to exist by the time that a plugin receives its
-    :meth:`~trinity.extensibility.plugin.BasePlugin.on_ready` call.
-    """
-
-    def __init__(self, endpoint: TrinityEventBusEndpoint, boot_info: TrinityBootInfo) -> None:
-        self._event_bus = endpoint
-        self._args: Namespace = boot_info.args
-        self._trinity_config: TrinityConfig = boot_info.trinity_config
-        # Leaving boot_kwargs as an undocumented public member as it will most likely go away
-        self.boot_kwargs: Dict[str, Any] = boot_info.boot_kwargs
-
-    @property
-    def args(self) -> Namespace:
-        """
-        Return the parsed arguments that were used to launch the application
-        """
-        return self._args
-
-    @property
-    def event_bus(self) -> TrinityEventBusEndpoint:
-        """
-        Return the :class:`~lahja.endpoint.Endpoint` that the plugin uses to connect to the
-        event bus
-        """
-        return self._event_bus
-
-    @property
-    def trinity_config(self) -> TrinityConfig:
-        """
-        Return the :class:`~trinity.config.TrinityConfig`
-        """
-        return self._trinity_config
-
-
 class BasePlugin(ABC):
 
-    context: PluginContext = None
-
     _status: PluginStatus = PluginStatus.NOT_READY
+
+    def __init__(self, boot_info: TrinityBootInfo) -> None:
+        self.boot_info = boot_info
+
+    @property
+    @abstractmethod
+    def event_bus(self) -> EndpointAPI:
+        ...
 
     @property
     @abstractmethod
@@ -125,7 +81,7 @@ class BasePlugin(ABC):
         """
         Describe the name of the plugin.
         """
-        pass
+        ...
 
     @property
     def normalized_name(self) -> str:
@@ -134,23 +90,13 @@ class BasePlugin(ABC):
         """
         return friendly_filename_or_url(self.name)
 
+    @classmethod
+    def get_logger(cls) -> logging.Logger:
+        return logging.getLogger(f'trinity.extensibility.plugin(#{cls.__name__})')
+
     @property
     def logger(self) -> logging.Logger:
-        """
-        Get the :class:`~logging.Logger` for this plugin.
-        """
-        return logging.getLogger(f'trinity.extensibility.plugin.BasePlugin#{self.name}')
-
-    @property
-    def event_bus(self) -> TrinityEventBusEndpoint:
-        """
-        Get the :class:`~lahja.endpoint.Endpoint` that this plugin uses to connect to the
-        event bus
-        """
-        if self.context is None:
-            raise EventBusNotReady("Tried accessing ``event_bus`` before ``ready`` was called")
-
-        return self.context.event_bus
+        return self.get_logger()
 
     @property
     def running(self) -> bool:
@@ -166,13 +112,7 @@ class BasePlugin(ABC):
         """
         return self._status
 
-    def set_context(self, context: PluginContext) -> None:
-        """
-        Set the :class:`~trinity.extensibility.plugin.PluginContext` for this plugin.
-        """
-        self.context = context
-
-    def ready(self, manager_eventbus: TrinityEventBusEndpoint) -> None:
+    def ready(self, manager_eventbus: EndpointAPI) -> None:
         """
         Set the ``status`` to ``PluginStatus.READY`` and delegate to
         :meth:`~trinity.extensibility.plugin.BasePlugin.on_ready`
@@ -180,11 +120,9 @@ class BasePlugin(ABC):
         self._status = PluginStatus.READY
         self.on_ready(manager_eventbus)
 
-    def on_ready(self, manager_eventbus: TrinityEventBusEndpoint) -> None:
+    def on_ready(self, manager_eventbus: EndpointAPI) -> None:
         """
-        Notify the plugin that it is ready to bootstrap itself. Plugins can rely
-        on the :class:`~trinity.extensibility.plugin.PluginContext` to be set
-        after this method has been called.
+        Notify the plugin that it is ready to bootstrap itself.
         The ``manager_eventbus`` refers to the instance of the
         :class:`~lahja.endpoint.Endpoint` that the
         :class:`~trinity.extensibility.plugin_manager.PluginManager` uses which may or may not
@@ -194,7 +132,8 @@ class BasePlugin(ABC):
         """
         pass
 
-    def configure_parser(self, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
+    @classmethod
+    def configure_parser(cls, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
         """
         Give the plugin a chance to amend the Trinity CLI argument parser. This hook is called
         before :meth:`~trinity.extensibility.plugin.BasePlugin.on_ready`
@@ -215,7 +154,7 @@ class BasePlugin(ABC):
 
         self._status = PluginStatus.STARTED
         self.do_start()
-        self.event_bus.broadcast(
+        self.event_bus.broadcast_nowait(
             PluginStartedEvent(type(self))
         )
         self.logger.info("Plugin started: %s", self.name)
@@ -231,34 +170,16 @@ class BasePlugin(ABC):
         pass
 
 
-class BaseAsyncStopPlugin(BasePlugin):
-    """
-    A :class:`~trinity.extensibility.plugin.BaseAsyncStopPlugin` unwinds asynchronoulsy, hence
-    needs to be awaited.
-    """
-
-    async def do_stop(self) -> None:
-        """
-        Asynchronously stop the plugin. Should be overwritten by subclasses.
-        """
-        pass
-
-    async def stop(self) -> None:
-        """
-        Delegate to :meth:`~trinity.extensibility.plugin.BaseAsyncStopPlugin.do_stop` causing the
-        plugin to stop asynchronously and setting ``running`` to ``False``.
-        """
-        await self.do_stop()
-        self._status = PluginStatus.STOPPED
-
-
 class BaseMainProcessPlugin(BasePlugin):
     """
     A :class:`~trinity.extensibility.plugin.BaseMainProcessPlugin` overtakes the whole main process
     early before any of the subsystems started. In that sense it redefines the whole meaning of the
     ``trinity`` command.
     """
-    pass
+
+    @property
+    def event_bus(self) -> EndpointAPI:
+        raise NotImplementedError('BaseMainProcessPlugins do not have event busses')
 
 
 class BaseIsolatedPlugin(BasePlugin):
@@ -271,8 +192,8 @@ class BaseIsolatedPlugin(BasePlugin):
     isolated plugin is stopped it does first receive a SIGINT followed by a SIGTERM soon after.
     It is up to the plugin to handle these signals accordingly.
     """
-
     _process: Process = None
+    _event_bus: EndpointAPI = None
 
     @property
     def process(self) -> Process:
@@ -287,38 +208,22 @@ class BaseIsolatedPlugin(BasePlugin):
         """
         self._status = PluginStatus.STARTED
         self._process = ctx.Process(
-            target=self._prepare_start,
+            target=self._prepare_spawn,
         )
 
         self._process.start()
         self.logger.info("Plugin started: %s (pid=%d)", self.name, self._process.pid)
 
-    def _prepare_start(self) -> None:
-        log_queue = self.context.boot_kwargs['log_queue']
-        level = self.context.boot_kwargs.get('log_level', logging.INFO)
-        setup_queue_logging(log_queue, level)
-        if self.context.args.log_levels:
-            setup_log_levels(self.context.args.log_levels)
-        connection_config = ConnectionConfig.from_name(
-            self.normalized_name, self.context.trinity_config.ipc_dir
-        )
-        self.event_bus.start_serving_nowait(connection_config)
-        self.event_bus.connect_to_endpoints_blocking(
-            ConnectionConfig.from_name(MAIN_EVENTBUS_ENDPOINT, self.context.trinity_config.ipc_dir)
-        )
-        # This makes the `main` process aware of this Endpoint which will then propagate the info
-        # so that every other Endpoint can connect directly to the plugin Endpoint
-        self.event_bus.announce_endpoint()
-        self.event_bus.broadcast(
-            PluginStartedEvent(type(self))
-        )
+    def _prepare_spawn(self) -> None:
+        if self.boot_info.boot_kwargs.pop('profile', False):
+            with profiler(f'profile_{self.normalized_name}'):
+                self._spawn_start()
+        else:
+            self._spawn_start()
 
-        # Whenever new EventBus Endpoints come up the `main` process broadcasts this event
-        # and we connect to every Endpoint directly
-        self.event_bus.auto_connect_new_announced_endpoints()
-
-        with self.context.trinity_config.process_id_file(self.normalized_name):
-            self.do_start()
+    @abstractmethod
+    def _spawn_start(self) -> None:
+        ...
 
     def stop(self) -> None:
         """
@@ -329,32 +234,9 @@ class BaseIsolatedPlugin(BasePlugin):
         """
         self._status = PluginStatus.STOPPED
 
-
-class DebugPlugin(BaseAsyncStopPlugin):
-    """
-    This is a dummy plugin useful for demonstration and debugging purposes
-    """
-
-    @property
-    def name(self) -> str:
-        return "Debug Plugin"
-
-    def configure_parser(self, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
-        arg_parser.add_argument("--debug-plugin", type=bool, required=False)
-
-    def handle_event(self, activation_event: BaseEvent) -> None:
-        self.logger.info("Debug plugin: handle_event called: %s", activation_event)
-
-    def do_start(self) -> None:
-        self.logger.info("Debug plugin: start called")
-        asyncio.ensure_future(self.count_forever())
-
-    async def count_forever(self) -> None:
-        i = 0
-        while True:
-            self.logger.info(i)
-            i += 1
-            await asyncio.sleep(1)
-
-    async def do_stop(self) -> None:
-        self.logger.info("Debug plugin: stop called")
+    def _setup_logging(self) -> None:
+        log_queue = self.boot_info.boot_kwargs['log_queue']
+        level = self.boot_info.boot_kwargs.get('log_level', logging.INFO)
+        setup_queue_logging(log_queue, level)
+        if self.boot_info.args.log_levels:
+            setup_log_levels(self.boot_info.args.log_levels)

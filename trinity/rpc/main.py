@@ -8,15 +8,18 @@ from typing import (
     Union,
 )
 
+from lahja import EndpointAPI
+
 from eth_utils import (
     ValidationError,
 )
 
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
+from trinity.chains.base import AsyncChainAPI
 from trinity.rpc.modules import (
     BaseRPCModule,
+)
+from trinity.rpc.retry import (
+    execute_with_retries,
 )
 
 REQUIRED_REQUEST_KEYS = {
@@ -54,7 +57,7 @@ class RPCServer:
     This "server" accepts json strings requests and returns the appropriate json string response,
     meeting the protocol for JSON-RPC defined here: https://github.com/ethereum/wiki/wiki/JSON-RPC
 
-    The key entry point for all requests is :meth:`RPCServer.request`, which
+    The key entry point for all requests is :meth:`RPCServer.execute`, which
     then proxies to the appropriate method. For example, see
     :meth:`RPCServer.eth_getBlockByHash`.
     """
@@ -62,8 +65,11 @@ class RPCServer:
 
     def __init__(self,
                  modules: Sequence[BaseRPCModule],
-                 event_bus: TrinityEventBusEndpoint=None) -> None:
+                 chain: AsyncChainAPI=None,
+                 event_bus: EndpointAPI=None) -> None:
+        self.event_bus = event_bus
         self.modules: Dict[str, BaseRPCModule] = {}
+        self.chain = chain
 
         for module in modules:
             name = module.name.lower()
@@ -109,7 +115,9 @@ class RPCServer:
 
             method = self._lookup_method(request['method'])
             params = request.get('params', [])
-            result = await method(*params)
+            result = await execute_with_retries(
+                self.event_bus, method, params, self.chain,
+            )
 
             if request['method'] == 'evm_resetToGenesisFixture':
                 result = True

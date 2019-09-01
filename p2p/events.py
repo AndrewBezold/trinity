@@ -1,3 +1,6 @@
+from dataclasses import (
+    dataclass,
+)
 from typing import (
     Tuple,
     Type,
@@ -8,24 +11,23 @@ from lahja import (
     BaseRequestResponseEvent,
 )
 
+from p2p.abc import NodeAPI
+
 
 class BaseDiscoveryServiceResponse(BaseEvent):
-
-    def __init__(self, error: Exception) -> None:
-        self.error = error
+    pass
 
 
+@dataclass
 class PeerCandidatesResponse(BaseDiscoveryServiceResponse):
 
-    def __init__(self, candidates: Tuple[str, ...], error: Exception=None) -> None:
-        super().__init__(error)
-        self.candidates = candidates
+    candidates: Tuple[NodeAPI, ...]
 
 
+@dataclass
 class PeerCandidatesRequest(BaseRequestResponseEvent[PeerCandidatesResponse]):
 
-    def __init__(self, max_candidates: int) -> None:
-        self.max_candidates = max_candidates
+    max_candidates: int
 
     @staticmethod
     def expected_response_type() -> Type[PeerCandidatesResponse]:
@@ -37,22 +39,3 @@ class RandomBootnodeRequest(BaseRequestResponseEvent[PeerCandidatesResponse]):
     @staticmethod
     def expected_response_type() -> Type[PeerCandidatesResponse]:
         return PeerCandidatesResponse
-
-
-class PeerCountResponse(BaseEvent):
-
-    def __init__(self, peer_count: int) -> None:
-        self.peer_count = peer_count
-
-
-class PeerCountRequest(BaseRequestResponseEvent[PeerCountResponse]):
-
-    @staticmethod
-    def expected_response_type() -> Type[PeerCountResponse]:
-        return PeerCountResponse
-
-
-class ConnectToNodeCommand(BaseEvent):
-
-    def __init__(self, node: str) -> None:
-        self.node = node

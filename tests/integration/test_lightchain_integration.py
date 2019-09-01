@@ -1,8 +1,10 @@
 import asyncio
 import logging
 from pathlib import Path
+import shutil
 import socket
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -22,22 +24,20 @@ from eth.chains.ropsten import (
 from eth.db.atomic import AtomicDB
 
 from p2p import ecies
+from p2p.constants import DEVP2P_V5
 from p2p.kademlia import Node
 
+from trinity._utils.ipc import kill_popen_gracefully
 from trinity.constants import ROPSTEN_NETWORK_ID
+from trinity.db.eth1.chain import AsyncChainDB
+from trinity.db.eth1.header import AsyncHeaderDB
 from trinity.protocol.common.context import ChainContext
 from trinity.protocol.les.peer import LESPeerPool
-from trinity.protocol.les.servers import LightRequestServer
 from trinity.sync.light.chain import LightChainSyncer
 from trinity.sync.light.service import LightPeerChain
-from trinity._utils.ipc import (
-    kill_popen_gracefully,
-)
+from trinity.tools.chain import AsyncRopstenChain
 
 from tests.core.integration_test_helpers import (
-    FakeAsyncChainDB,
-    FakeAsyncRopstenChain,
-    FakeAsyncHeaderDB,
     connect_to_peers_loop,
 )
 
@@ -49,8 +49,11 @@ async def geth_port(unused_tcp_port):
 
 @pytest.fixture
 def geth_datadir():
-    datadir = Path(__file__).parent / 'fixtures' / 'geth_lightchain_datadir'
-    return datadir.absolute()
+    fixture_datadir = Path(__file__).parent / 'fixtures' / 'geth_lightchain_datadir'
+    with tempfile.TemporaryDirectory() as temp_dir:
+        datadir = Path(temp_dir) / 'geth'
+        shutil.copytree(fixture_datadir, datadir)
+        yield datadir
 
 
 @pytest.fixture
@@ -161,28 +164,29 @@ async def test_lightchain_integration(
 
     remote = Node.from_uri(enode)
     base_db = AtomicDB()
-    chaindb = FakeAsyncChainDB(base_db)
+    chaindb = AsyncChainDB(base_db)
     chaindb.persist_header(ROPSTEN_GENESIS_HEADER)
-    headerdb = FakeAsyncHeaderDB(base_db)
+    headerdb = AsyncHeaderDB(base_db)
     context = ChainContext(
         headerdb=headerdb,
         network_id=ROPSTEN_NETWORK_ID,
         vm_configuration=ROPSTEN_VM_CONFIGURATION,
+        client_version_string='trinity-test',
+        listen_port=30303,
+        p2p_version=DEVP2P_V5,
     )
     peer_pool = LESPeerPool(
         privkey=ecies.generate_privkey(),
         context=context,
     )
-    chain = FakeAsyncRopstenChain(base_db)
+    chain = AsyncRopstenChain(base_db)
     syncer = LightChainSyncer(chain, chaindb, peer_pool)
     syncer.min_peers_to_sync = 1
     peer_chain = LightPeerChain(headerdb, peer_pool)
-    server_request_handler = LightRequestServer(headerdb, peer_pool)
 
     asyncio.ensure_future(peer_pool.run())
     asyncio.ensure_future(connect_to_peers_loop(peer_pool, tuple([remote])))
     asyncio.ensure_future(peer_chain.run())
-    asyncio.ensure_future(server_request_handler.run())
     asyncio.ensure_future(syncer.run())
     await asyncio.sleep(0)  # Yield control to give the LightChainSyncer a chance to start
 
@@ -190,7 +194,6 @@ async def test_lightchain_integration(
         event_loop.run_until_complete(peer_pool.cancel())
         event_loop.run_until_complete(peer_chain.cancel())
         event_loop.run_until_complete(syncer.cancel())
-        event_loop.run_until_complete(server_request_handler.cancel())
 
     request.addfinalizer(finalizer)
 

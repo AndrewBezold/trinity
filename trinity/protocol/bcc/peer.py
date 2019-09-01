@@ -1,93 +1,95 @@
-from typing import (
-    cast,
-)
+from typing import Sequence, Tuple
 
-from eth_utils import (
-    encode_hex,
-)
+from lahja import EndpointAPI
 
-from eth2.beacon.db.chain import BaseBeaconChainDB
 from eth2.beacon.types.blocks import (
     BeaconBlock,
 )
 
-from eth2.beacon.typing import (
-    Slot,
+from lahja import (
+    BroadcastConfig,
 )
 
+from p2p.abc import CommandAPI, HandshakeReceiptAPI, NodeAPI
+from p2p.handshake import DevP2PReceipt
 from p2p.peer import (
     BasePeer,
     BasePeerFactory,
 )
-from p2p.peer_pool import (
-    BasePeerPool,
-)
-from p2p.protocol import (
-    Command,
-    _DecodedMsgType,
-)
-from p2p.exceptions import HandshakeFailure
-from p2p.p2p_proto import DisconnectReason
+from p2p.peer_pool import BasePeerPool
+from p2p.protocol import Payload
 
 from trinity.protocol.bcc.handlers import BCCExchangeHandler
 
-from trinity.protocol.bcc.proto import BCCProtocol
+from trinity.protocol.bcc.proto import BCCProtocol, ProxyBCCProtocol
 from trinity.protocol.bcc.commands import (
-    Status,
-    StatusMessage,
+    GetBeaconBlocks,
 )
 from trinity.protocol.bcc.context import (
     BeaconContext,
 )
+from trinity.protocol.common.peer import (
+    BaseProxyPeer,
+)
+from trinity.protocol.common.peer_pool_event_bus import (
+    PeerPoolEventServer,
+)
+
+from .events import (
+    GetBeaconBlocksEvent,
+    SendBeaconBlocksEvent,
+)
+from .handshaker import (
+    BCCHandshaker,
+    BCCHandshakeReceipt,
+)
+from .proto import BCCHandshakeParams
+
+
+class BCCProxyPeer(BaseProxyPeer):
+    """
+    A ``BCCPeer`` that can be used from any process instead of the actual peer pool peer.
+    Any action performed on the ``BCCProxyPeer`` is delegated to the actual peer in the pool.
+    This does not yet mimic all APIs of the real peer.
+    """
+
+    def __init__(self,
+                 remote: NodeAPI,
+                 event_bus: EndpointAPI,
+                 sub_proto: ProxyBCCProtocol):
+
+        super().__init__(remote, event_bus)
+
+        self.sub_proto = sub_proto
+
+    @classmethod
+    def from_node(cls,
+                  remote: NodeAPI,
+                  event_bus: EndpointAPI,
+                  broadcast_config: BroadcastConfig) -> 'BCCProxyPeer':
+        return cls(remote, event_bus, ProxyBCCProtocol(remote, event_bus, broadcast_config))
 
 
 class BCCPeer(BasePeer):
-
-    _supported_sub_protocols = [BCCProtocol]
+    supported_sub_protocols = (BCCProtocol,)
     sub_proto: BCCProtocol = None
 
     _requests: BCCExchangeHandler = None
 
-    context: BeaconContext
-
-    head_slot: Slot = None
-
-    async def send_sub_proto_handshake(self) -> None:
-        # TODO: pass accurate `block_class: Type[BaseBeaconBlock]` under per BeaconStateMachine fork
-        genesis = self.chain_db.get_canonical_block_by_slot(0, BeaconBlock)
-        head_slot = self.chain_db.get_canonical_head(BeaconBlock).slot
-        self.sub_proto.send_handshake(genesis.hash, head_slot)
-
-    async def process_sub_proto_handshake(self, cmd: Command, msg: _DecodedMsgType) -> None:
-        if not isinstance(cmd, Status):
-            await self.disconnect(DisconnectReason.subprotocol_error)
-            raise HandshakeFailure(f"Expected a BCC Status msg, got {cmd}, disconnecting")
-
-        msg = cast(StatusMessage, msg)
-        if msg['network_id'] != self.network_id:
-            await self.disconnect(DisconnectReason.useless_peer)
-            raise HandshakeFailure(
-                f"{self} network ({msg['network_id']}) does not match ours "
-                f"({self.network_id}), disconnecting"
+    def process_handshake_receipts(self,
+                                   devp2p_receipt: DevP2PReceipt,
+                                   protocol_receipts: Sequence[HandshakeReceiptAPI]) -> None:
+        super().process_handshake_receipts(devp2p_receipt, protocol_receipts)
+        for receipt in protocol_receipts:
+            if isinstance(receipt, BCCHandshakeReceipt):
+                self.head_slot = receipt.handshake_params.head_slot
+                self.genesis_root = receipt.handshake_params.genesis_root
+                self.network_id = receipt.handshake_params.network_id
+                break
+        else:
+            raise Exception(
+                "Did not find an `BCCHandshakeReceipt` in {protocol_receipts}"
             )
-        # TODO: pass accurate `block_class: Type[BaseBeaconBlock]` under per BeaconStateMachine fork
-        genesis_block = self.chain_db.get_canonical_block_by_slot(0, BeaconBlock)
-        if msg['genesis_hash'] != genesis_block.hash:
-            await self.disconnect(DisconnectReason.useless_peer)
-            raise HandshakeFailure(
-                f"{self} genesis ({encode_hex(msg['genesis_hash'])}) does not "
-                f"match ours ({encode_hex(genesis_block.hash)}), disconnecting"
-            )
-
-        self.head_slot = msg['head_slot']
-
-    @property
-    def network_id(self) -> int:
-        return self.context.network_id
-
-    @property
-    def chain_db(self) -> BaseBeaconChainDB:
-        return self.context.chain_db
 
     @property
     def requests(self) -> BCCExchangeHandler:
@@ -100,6 +102,51 @@ class BCCPeerFactory(BasePeerFactory):
     context: BeaconContext
     peer_class = BCCPeer
 
+    async def get_handshakers(self) -> Tuple[BCCHandshaker, ...]:
+        chain_db = self.context.chain_db
+        head = await chain_db.coro_get_canonical_head(BeaconBlock)
+        genesis_root = await chain_db.coro_get_genesis_block_root()
+
+        handshake_params = BCCHandshakeParams(
+            head_slot=head.slot,
+            genesis_root=genesis_root,
+            network_id=self.context.network_id,
+            protocol_version=BCCProtocol.version,
+        )
+        return (
+            BCCHandshaker(handshake_params),
+        )
+
 
 class BCCPeerPool(BasePeerPool):
     peer_factory_class = BCCPeerFactory
+
+
+class BCCPeerPoolEventServer(PeerPoolEventServer[BCCPeer]):
+    """
+    BCC protocol specific ``PeerPoolEventServer``. See ``PeerPoolEventServer`` for more info.
+    """
+
+    subscription_msg_types = frozenset({GetBeaconBlocks})
+
+    async def _run(self) -> None:
+
+        self.run_daemon_event(
+            SendBeaconBlocksEvent,
+            lambda event: self.try_with_node(
+                event.remote,
+                lambda peer: peer.sub_proto.send_blocks(event.blocks, event.request_id)
+            )
+        )
+
+        await super()._run()
+
+    async def handle_native_peer_message(self,
+                                         remote: NodeAPI,
+                                         cmd: CommandAPI,
+                                         msg: Payload) -> None:
+
+        if isinstance(cmd, GetBeaconBlocks):
+            await self.event_bus.broadcast(GetBeaconBlocksEvent(remote, cmd, msg))
+        else:
+            raise Exception(f"Command {cmd} is not broadcasted")

@@ -1,30 +1,37 @@
 from abc import abstractmethod
 from typing import (
     AsyncIterator,
+    Iterable,
     Tuple,
-    cast,
+    Type,
 )
 
 from cancel_token import CancelToken, OperationCancelled
+
+from lahja import EndpointAPI
 
 from eth.exceptions import (
     HeaderNotFound,
 )
 from eth_typing import (
     BlockNumber,
-    Hash32,
 )
 from eth.rlp.headers import BlockHeader
-from p2p import protocol
-from p2p.cancellable import CancellableMixin
-from p2p.peer import BasePeer, PeerSubscriber
-from p2p.protocol import (
-    Command,
-    _DecodedMsgType,
+from lahja import (
+    BroadcastConfig,
 )
+
+from p2p.abc import CommandAPI, NodeAPI
+from p2p.cancellable import CancellableMixin
+from p2p.peer import (
+    BasePeer,
+    PeerSubscriber,
+)
+from p2p.typing import Payload
 from p2p.service import BaseService
 
 from trinity.db.eth1.header import BaseAsyncHeaderDB
+from trinity.protocol.common.events import PeerPoolMessageEvent
 from trinity.protocol.common.peer import BasePeerPool
 from trinity.protocol.common.requests import BaseHeaderRequest
 from trinity._utils.logging import HasExtendedDebugLogger
@@ -55,13 +62,13 @@ class BaseRequestServer(BaseService, PeerSubscriber):
     async def _handle_msg_loop(self) -> None:
         while self.is_operational:
             peer, cmd, msg = await self.wait(self.msg_queue.get())
-            self.run_task(self._quiet_handle_msg(cast(BasePeer, peer), cmd, msg))
+            self.run_task(self._quiet_handle_msg(peer, cmd, msg))
 
     async def _quiet_handle_msg(
             self,
             peer: BasePeer,
-            cmd: protocol.Command,
-            msg: protocol._DecodedMsgType) -> None:
+            cmd: CommandAPI,
+            msg: Payload) -> None:
         try:
             await self._handle_msg(peer, cmd, msg)
         except OperationCancelled:
@@ -72,11 +79,62 @@ class BaseRequestServer(BaseService, PeerSubscriber):
             self.logger.exception("Unexpected error when processing msg from %s", peer)
 
     @abstractmethod
-    async def _handle_msg(self, peer: BasePeer, cmd: Command, msg: _DecodedMsgType) -> None:
+    async def _handle_msg(self, peer: BasePeer, cmd: CommandAPI, msg: Payload) -> None:
         """
         Identify the command, and react appropriately.
         """
-        pass
+        ...
+
+
+class BaseIsolatedRequestServer(BaseService):
+    """
+    Monitor commands from peers, to identify inbound requests that should receive a response.
+    Handle those inbound requests by querying our local database and replying.
+    """
+
+    def __init__(
+            self,
+            event_bus: EndpointAPI,
+            broadcast_config: BroadcastConfig,
+            subscribed_events: Iterable[Type[PeerPoolMessageEvent]],
+            token: CancelToken = None) -> None:
+        super().__init__(token)
+        self.event_bus = event_bus
+        self.broadcast_config = broadcast_config
+        self._subscribed_events = subscribed_events
+
+    async def _run(self) -> None:
+
+        for event_type in self._subscribed_events:
+            self.run_daemon_task(self.handle_stream(event_type))
+
+        await self.cancellation()
+
+    async def handle_stream(self, event_type: Type[PeerPoolMessageEvent]) -> None:
+        while self.is_operational:
+            async for event in self.wait_iter(self.event_bus.stream(event_type)):
+                self.run_task(self._quiet_handle_msg(event.remote, event.cmd, event.msg))
+
+    async def _quiet_handle_msg(
+            self,
+            remote: NodeAPI,
+            cmd: CommandAPI,
+            msg: Payload) -> None:
+        try:
+            await self._handle_msg(remote, cmd, msg)
+        except OperationCancelled:
+            # Silently swallow OperationCancelled exceptions because otherwise they'll be caught
+            # by the except below and treated as unexpected.
+            pass
+        except Exception:
+            self.logger.exception("Unexpected error when processing msg from %s", remote)
+
+    @abstractmethod
+    async def _handle_msg(self,
+                          remote: NodeAPI,
+                          cmd: CommandAPI,
+                          msg: Payload) -> None:
+        ...
 
 
 class BasePeerRequestHandler(CancellableMixin, HasExtendedDebugLogger):
@@ -113,7 +171,7 @@ class BasePeerRequestHandler(CancellableMixin, HasExtendedDebugLogger):
         """
         if isinstance(request.block_number_or_hash, bytes):
             header = await self.wait(
-                self.db.coro_get_block_header_by_hash(cast(Hash32, request.block_number_or_hash)))
+                self.db.coro_get_block_header_by_hash(request.block_number_or_hash))
             return request.generate_block_numbers(header.block_number)
         elif isinstance(request.block_number_or_hash, int):
             # We don't need to pass in the block number to

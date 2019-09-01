@@ -1,777 +1,613 @@
-import functools
-from typing import (  # noqa: F401
-    Iterable,
-    Sequence,
-    Tuple,
-    TYPE_CHECKING,
-)
+from typing import Iterable, Sequence, Tuple, cast  # noqa: F401
 
-from eth_typing import (
-    Hash32
-)
-from eth_utils import (
-    to_tuple,
-    ValidationError,
-)
+from eth.constants import ZERO_HASH32
+from eth_typing import BLSPubkey, BLSSignature, Hash32
+from eth_utils import ValidationError, encode_hex
+import ssz
 
-from eth.constants import (
-    ZERO_HASH32,
+from eth2._utils.bls import bls
+from eth2._utils.hash import hash_eth2
+from eth2.beacon.attestation_helpers import (
+    get_attestation_data_slot,
+    is_slashable_attestation_data,
+    validate_indexed_attestation,
 )
-
-from eth2._utils import (
-    bls,
-    bitfield,
-)
-
-from eth2.beacon.committee_helpers import (
-    get_beacon_proposer_index,
-    get_crosslink_committee_for_attestation,
-    get_members_from_bitfield,
-)
-from eth2.beacon.configs import (
-    CommitteeConfig,
-)
-from eth2.beacon.enums import (
-    SignatureDomain,
-)
-from eth2.beacon.helpers import (
-    get_block_root,
-    get_epoch_start_slot,
-    get_delayed_activation_exit_epoch,
-    get_domain,
-    is_double_vote,
-    is_surround_vote,
-    slot_to_epoch,
-)
-from eth2.beacon.types.attestations import Attestation  # noqa: F401
-from eth2.beacon.types.attestation_data import AttestationData  # noqa: F401
-from eth2.beacon.types.attestation_data_and_custody_bits import AttestationDataAndCustodyBit
-from eth2.beacon.types.attester_slashings import AttesterSlashing  # noqa: F401
-from eth2.beacon.types.blocks import BaseBeaconBlock  # noqa: F401
-from eth2.beacon.types.crosslink_records import CrosslinkRecord
-from eth2.beacon.types.forks import Fork  # noqa: F401
-from eth2.beacon.types.proposal import Proposal
-from eth2.beacon.types.slashable_attestations import SlashableAttestation  # noqa: F401
+from eth2.beacon.committee_helpers import get_beacon_proposer_index
+from eth2.beacon.constants import FAR_FUTURE_EPOCH
+from eth2.beacon.epoch_processing_helpers import get_indexed_attestation
+from eth2.beacon.exceptions import SignatureError
+from eth2.beacon.helpers import compute_epoch_of_slot, get_domain
+from eth2.beacon.signature_domain import SignatureDomain
+from eth2.beacon.types.attestation_data import AttestationData
+from eth2.beacon.types.attestations import Attestation, IndexedAttestation
+from eth2.beacon.types.attester_slashings import AttesterSlashing
+from eth2.beacon.types.blocks import BaseBeaconBlock, BeaconBlockHeader
+from eth2.beacon.types.checkpoints import Checkpoint
+from eth2.beacon.types.crosslinks import Crosslink
 from eth2.beacon.types.proposer_slashings import ProposerSlashing
-from eth2.beacon.types.states import BeaconState  # noqa: F401
-from eth2.beacon.types.voluntary_exits import VoluntaryExit  # noqa: F401
-from eth2.beacon.typing import (
-    Bitfield,
-    BLSPubkey,
-    BLSSignature,
-    Epoch,
-    Shard,
-    Slot,
-    ValidatorIndex,
-)
-from eth2.beacon.validation import (
-    validate_bitfield,
-)
+from eth2.beacon.types.states import BeaconState
+from eth2.beacon.types.transfers import Transfer
+from eth2.beacon.types.validators import Validator
+from eth2.beacon.types.voluntary_exits import VoluntaryExit
+from eth2.beacon.typing import Epoch, Shard, Slot
+from eth2.configs import CommitteeConfig, Eth2Config
 
-if TYPE_CHECKING:
-    from eth2.beacon.types.validator_records import ValidatorRecord  # noqa: F401
+
+def validate_correct_number_of_deposits(
+    state: BeaconState, block: BaseBeaconBlock, config: Eth2Config
+) -> None:
+    body = block.body
+    deposit_count_in_block = len(body.deposits)
+    expected_deposit_count = min(
+        config.MAX_DEPOSITS, state.eth1_data.deposit_count - state.eth1_deposit_index
+    )
+
+    if deposit_count_in_block != expected_deposit_count:
+        raise ValidationError(
+            f"Incorrect number of deposits ({deposit_count_in_block})"
+            f" in block (encode_hex(block_root));"
+            f" expected {expected_deposit_count} based on"
+            f" the state {encode_hex(state.hash_tree_root)}"
+        )
+
+
+def validate_unique_transfers(
+    state: BeaconState, block: BaseBeaconBlock, config: Eth2Config
+) -> None:
+    body = block.body
+    transfer_count_in_block = len(body.transfers)
+    unique_transfer_count = len(set(body.transfers))
+
+    if transfer_count_in_block != unique_transfer_count:
+        raise ValidationError(
+            f"Found duplicate transfers in the block {encode_hex(block.hash_tree_root)}"
+        )
 
 
 #
-# Slot validatation
+# Block validatation
 #
-def validate_block_slot(state: BeaconState,
-                        block: BaseBeaconBlock) -> None:
+def validate_block_slot(state: BeaconState, block: BaseBeaconBlock) -> None:
     if block.slot != state.slot:
         raise ValidationError(
             f"block.slot ({block.slot}) is not equal to state.slot ({state.slot})"
         )
 
 
-#
-# Proposer signature validation
-#
-def validate_proposer_signature(state: BeaconState,
-                                block: BaseBeaconBlock,
-                                beacon_chain_shard_number: Shard,
-                                committee_config: CommitteeConfig) -> None:
-    block_without_signature_root = block.block_without_signature_root
+def validate_block_parent_root(state: BeaconState, block: BaseBeaconBlock) -> None:
+    expected_root = state.latest_block_header.signing_root
+    parent_root = block.parent_root
+    if parent_root != expected_root:
+        raise ValidationError(
+            f"block.parent_root ({encode_hex(parent_root)}) is not equal to "
+            f"state.latest_block_header.signing_root ({encode_hex(expected_root)}"
+        )
 
-    # TODO: Replace this with signed_root
-    proposal = Proposal(
-        state.slot,
-        beacon_chain_shard_number,
-        block_without_signature_root,
-        signature=block.signature,
-    )
+
+def validate_proposer_is_not_slashed(
+    state: BeaconState, block_root: Hash32, config: CommitteeConfig
+) -> None:
+    proposer_index = get_beacon_proposer_index(state, config)
+    proposer = state.validators[proposer_index]
+    if proposer.slashed:
+        raise ValidationError(f"Proposer for block {encode_hex(block_root)} is slashed")
+
+
+def validate_proposer_signature(
+    state: BeaconState, block: BaseBeaconBlock, committee_config: CommitteeConfig
+) -> None:
+    message_hash = block.signing_root
 
     # Get the public key of proposer
-    beacon_proposer_index = get_beacon_proposer_index(
-        state,
-        state.slot,
-        committee_config,
-    )
-    proposer_pubkey = state.validator_registry[beacon_proposer_index].pubkey
+    beacon_proposer_index = get_beacon_proposer_index(state, committee_config)
+    proposer_pubkey = state.validators[beacon_proposer_index].pubkey
     domain = get_domain(
-        state.fork,
-        state.current_epoch(committee_config.SLOTS_PER_EPOCH),
-        SignatureDomain.DOMAIN_PROPOSAL
+        state, SignatureDomain.DOMAIN_BEACON_PROPOSER, committee_config.SLOTS_PER_EPOCH
     )
 
-    is_valid_signature = bls.verify(
-        pubkey=proposer_pubkey,
-        message_hash=proposal.signed_root,
-        signature=proposal.signature,
-        domain=domain,
-    )
-
-    if not is_valid_signature:
-        raise ValidationError(
-            f"Invalid Proposer Signature on block, beacon_proposer_index={beacon_proposer_index}, "
-            f"pubkey={proposer_pubkey}, message_hash={proposal.signed_root}, "
-            f"block.signature={block.signature}, domain={domain}"
+    try:
+        bls.validate(
+            pubkey=proposer_pubkey,
+            message_hash=message_hash,
+            signature=block.signature,
+            domain=domain,
         )
+    except SignatureError as error:
+        raise ValidationError(
+            f"Invalid Proposer Signature on block, beacon_proposer_index={beacon_proposer_index}",
+            error,
+        )
+
+
+#
+# RANDAO validatation
+#
+def validate_randao_reveal(
+    state: BeaconState,
+    proposer_index: int,
+    epoch: Epoch,
+    randao_reveal: Hash32,
+    slots_per_epoch: int,
+) -> None:
+    proposer = state.validators[proposer_index]
+    proposer_pubkey = proposer.pubkey
+    message_hash = ssz.get_hash_tree_root(epoch, sedes=ssz.sedes.uint64)
+    domain = get_domain(state, SignatureDomain.DOMAIN_RANDAO, slots_per_epoch)
+
+    try:
+        bls.validate(
+            pubkey=proposer_pubkey,
+            message_hash=message_hash,
+            signature=cast(BLSSignature, randao_reveal),
+            domain=domain,
+        )
+    except SignatureError as error:
+        raise ValidationError("RANDAO reveal is invalid", error)
 
 
 #
 # Proposer slashing validation
 #
-def validate_proposer_slashing(state: BeaconState,
-                               proposer_slashing: ProposerSlashing,
-                               slots_per_epoch: int) -> None:
+def validate_proposer_slashing(
+    state: BeaconState, proposer_slashing: ProposerSlashing, slots_per_epoch: int
+) -> None:
     """
     Validate the given ``proposer_slashing``.
     Raise ``ValidationError`` if it's invalid.
     """
-    proposer = state.validator_registry[proposer_slashing.proposer_index]
+    proposer = state.validators[proposer_slashing.proposer_index]
 
-    validate_proposer_slashing_slot(proposer_slashing)
+    validate_proposer_slashing_epoch(proposer_slashing, slots_per_epoch)
 
-    validate_proposer_slashing_shard(proposer_slashing)
+    validate_proposer_slashing_headers(proposer_slashing)
 
-    validate_proposer_slashing_block_root(proposer_slashing)
+    validate_proposer_slashing_is_slashable(state, proposer, slots_per_epoch)
 
-    validate_proposer_slashing_is_slashed(proposer.slashed)
-
-    validate_proposal_signature(
-        proposal=proposer_slashing.proposal_1,
+    validate_block_header_signature(
+        state=state,
+        header=proposer_slashing.header_1,
         pubkey=proposer.pubkey,
-        fork=state.fork,
         slots_per_epoch=slots_per_epoch,
     )
 
-    validate_proposal_signature(
-        proposal=proposer_slashing.proposal_2,
+    validate_block_header_signature(
+        state=state,
+        header=proposer_slashing.header_2,
         pubkey=proposer.pubkey,
-        fork=state.fork,
         slots_per_epoch=slots_per_epoch,
     )
 
 
-def validate_proposer_slashing_slot(proposer_slashing: ProposerSlashing) -> None:
-    if proposer_slashing.proposal_1.slot != proposer_slashing.proposal_2.slot:
+def validate_proposer_slashing_epoch(
+    proposer_slashing: ProposerSlashing, slots_per_epoch: int
+) -> None:
+    epoch_1 = compute_epoch_of_slot(proposer_slashing.header_1.slot, slots_per_epoch)
+    epoch_2 = compute_epoch_of_slot(proposer_slashing.header_2.slot, slots_per_epoch)
+
+    if epoch_1 != epoch_2:
         raise ValidationError(
-            f"proposer_slashing.proposal_1.slot ({proposer_slashing.proposal_1.slot}) !="
-            f" proposer_slashing.proposal_2.slot ({proposer_slashing.proposal_2.slot})"
+            f"Epoch of proposer_slashing.proposal_1 ({epoch_1}) !="
+            f" epoch of proposer_slashing.proposal_2 ({epoch_2})"
         )
 
 
-def validate_proposer_slashing_shard(proposer_slashing: ProposerSlashing) -> None:
-    if proposer_slashing.proposal_1.shard != proposer_slashing.proposal_2.shard:
+def validate_proposer_slashing_headers(proposer_slashing: ProposerSlashing) -> None:
+    header_1 = proposer_slashing.header_1
+    header_2 = proposer_slashing.header_2
+    if header_1 == header_2:
         raise ValidationError(
-            f"proposer_slashing.proposal_1.shard ({proposer_slashing.proposal_1.shard}) "
-            f"!= proposer_slashing.proposal_2.shard"
-            f" ({proposer_slashing.proposal_2.shard})"
+            f"proposer_slashing.header_1 ({header_1}) == proposer_slashing.header_2 ({header_2})"
         )
 
 
-def validate_proposer_slashing_block_root(proposer_slashing: ProposerSlashing) -> None:
-    if proposer_slashing.proposal_1.block_root == proposer_slashing.proposal_2.block_root:
+def validate_proposer_slashing_is_slashable(
+    state: BeaconState, proposer: Validator, slots_per_epoch: int
+) -> None:
+    current_epoch = state.current_epoch(slots_per_epoch)
+    is_slashable = proposer.is_slashable(current_epoch)
+    if not is_slashable:
         raise ValidationError(
-            "proposer_slashing.proposal_1.block_root "
-            f"({proposer_slashing.proposal_1.block_root}) "
-            "should not be equal to proposer_slashing.proposal_2.block_root "
-            f"({proposer_slashing.proposal_2.block_root})"
+            f"Proposer {encode_hex(proposer.pubkey)} is not slashable in epoch {current_epoch}."
         )
 
 
-def validate_proposer_slashing_is_slashed(slashed: bool) -> None:
-    if slashed:
-        raise ValidationError(f"proposer.slashed is True")
-
-
-def validate_proposal_signature(proposal: Proposal,
-                                pubkey: BLSPubkey,
-                                fork: Fork,
-                                slots_per_epoch: int) -> None:
-    proposal_signature_is_valid = bls.verify(
-        pubkey=pubkey,
-        message_hash=proposal.signed_root,  # TODO: use signed_root
-        signature=proposal.signature,
-        domain=get_domain(
-            fork,
-            slot_to_epoch(proposal.slot, slots_per_epoch),
-            SignatureDomain.DOMAIN_PROPOSAL,
+def validate_block_header_signature(
+    state: BeaconState,
+    header: BeaconBlockHeader,
+    pubkey: BLSPubkey,
+    slots_per_epoch: int,
+) -> None:
+    try:
+        bls.validate(
+            pubkey=pubkey,
+            message_hash=header.signing_root,
+            signature=header.signature,
+            domain=get_domain(
+                state,
+                SignatureDomain.DOMAIN_BEACON_PROPOSER,
+                slots_per_epoch,
+                compute_epoch_of_slot(header.slot, slots_per_epoch),
+            ),
         )
-    )
-    if not proposal_signature_is_valid:
-        raise ValidationError(
-            "Proposal signature is invalid: "
-            f"proposer pubkey: {pubkey}, message_hash: {proposal.signed_root}, "
-            f"signature: {proposal.signature}"
-        )
+    except SignatureError as error:
+        raise ValidationError("Header signature is invalid:", error)
 
 
 #
 # Attester slashing validation
 #
-def validate_attester_slashing(state: BeaconState,
-                               attester_slashing: AttesterSlashing,
-                               max_indices_per_slashable_vote: int,
-                               slots_per_epoch: int) -> None:
-    slashable_attestation_1 = attester_slashing.slashable_attestation_1
-    slashable_attestation_2 = attester_slashing.slashable_attestation_2
-
-    validate_attester_slashing_different_data(slashable_attestation_1, slashable_attestation_2)
-
-    validate_attester_slashing_slashing_conditions(
-        slashable_attestation_1,
-        slashable_attestation_2,
-        slots_per_epoch,
+def validate_is_slashable_attestation_data(
+    attestation_1: IndexedAttestation, attestation_2: IndexedAttestation
+) -> None:
+    is_slashable_data = is_slashable_attestation_data(
+        attestation_1.data, attestation_2.data
     )
 
-    validate_slashable_attestation(
-        state,
-        slashable_attestation_1,
-        max_indices_per_slashable_vote,
-        slots_per_epoch,
-    )
-
-    validate_slashable_attestation(
-        state,
-        slashable_attestation_2,
-        max_indices_per_slashable_vote,
-        slots_per_epoch,
-    )
-
-
-def validate_attester_slashing_different_data(
-        slashable_attestation_1: SlashableAttestation,
-        slashable_attestation_2: SlashableAttestation) -> None:
-    if slashable_attestation_1.data == slashable_attestation_2.data:
+    if not is_slashable_data:
         raise ValidationError(
-            "slashable_attestation_1.data "
-            f"({slashable_attestation_1.data}) "
-            "should not be equal to slashable_attestation_2.data "
-            f"({slashable_attestation_2.data})"
+            "The `AttesterSlashing` object doesn't meet the Casper FFG slashing conditions."
         )
 
 
-def validate_attester_slashing_slashing_conditions(
-        slashable_attestation_1: SlashableAttestation,
-        slashable_attestation_2: SlashableAttestation,
-        slots_per_epoch: int) -> None:
-    is_double_vote_slashing = is_double_vote(
-        slashable_attestation_1.data,
-        slashable_attestation_2.data,
-        slots_per_epoch,
+def validate_attester_slashing(
+    state: BeaconState,
+    attester_slashing: AttesterSlashing,
+    max_validators_per_committee: int,
+    slots_per_epoch: int,
+) -> None:
+    attestation_1 = attester_slashing.attestation_1
+    attestation_2 = attester_slashing.attestation_2
+
+    validate_is_slashable_attestation_data(attestation_1, attestation_2)
+
+    validate_indexed_attestation(
+        state, attestation_1, max_validators_per_committee, slots_per_epoch
     )
-    is_surround_vote_slashing = is_surround_vote(
-        slashable_attestation_1.data,
-        slashable_attestation_2.data,
-        slots_per_epoch,
+
+    validate_indexed_attestation(
+        state, attestation_2, max_validators_per_committee, slots_per_epoch
     )
-    if not (is_double_vote_slashing or is_surround_vote_slashing):
-        raise ValidationError(
-            "The `AttesterSlashing` object doesn't meet `is_double_vote` or `is_surround_vote`"
-        )
 
 
-def validate_slashable_indices(slashable_indices: Sequence[ValidatorIndex]) -> None:
-    if len(slashable_indices) < 1:
+def validate_some_slashing(
+    slashed_any: bool, attester_slashing: AttesterSlashing
+) -> None:
+    if not slashed_any:
         raise ValidationError(
-            "len(slashable_indices) should be greater or equal to 1"
+            f"Attesting slashing {attester_slashing} did not yield any slashable validators."
         )
 
 
 #
 # Attestation validation
 #
-def validate_attestation(state: BeaconState,
-                         attestation: Attestation,
-                         min_attestation_inclusion_delay: int,
-                         latest_block_roots_length: int,
-                         committee_config: CommitteeConfig) -> None:
+def _validate_eligible_shard_number(shard: Shard, shard_count: int) -> None:
+    if shard >= shard_count:
+        raise ValidationError(
+            f"Attestation with shard {shard} must be less than the total shard count {shard_count}"
+        )
+
+
+def _validate_eligible_target_epoch(
+    target_epoch: Epoch, current_epoch: Epoch, previous_epoch: Epoch
+) -> None:
+    if target_epoch not in (previous_epoch, current_epoch):
+        raise ValidationError(
+            f"Attestation with target epoch {target_epoch} must be in either the"
+            f" previous epoch {previous_epoch} or the current epoch {current_epoch}"
+        )
+
+
+def validate_attestation_slot(
+    attestation_slot: Slot,
+    state_slot: Slot,
+    slots_per_epoch: int,
+    min_attestation_inclusion_delay: int,
+) -> None:
+    if attestation_slot + min_attestation_inclusion_delay > state_slot:
+        raise ValidationError(
+            f"Attestation at slot {attestation_slot} can only be included after the"
+            f" minimum delay {min_attestation_inclusion_delay} with respect to the"
+            f" state's slot {state_slot}."
+        )
+
+    if state_slot > attestation_slot + slots_per_epoch:
+        raise ValidationError(
+            f"Attestation at slot {attestation_slot} must be within {slots_per_epoch}"
+            f" slots (1 epoch) of the state's slot {state_slot}"
+        )
+
+
+def _validate_checkpoint(
+    checkpoint: Checkpoint, expected_checkpoint: Checkpoint
+) -> None:
+    if checkpoint != expected_checkpoint:
+        raise ValidationError(
+            f"Attestation with source checkpoint {checkpoint} did not match the expected"
+            f" source checkpoint ({expected_checkpoint}) based on the specified ``target.epoch``."
+        )
+
+
+def _validate_crosslink(
+    crosslink: Crosslink,
+    target_epoch: Epoch,
+    parent_crosslink: Crosslink,
+    max_epochs_per_crosslink: int,
+) -> None:
+    if crosslink.start_epoch != parent_crosslink.end_epoch:
+        raise ValidationError(
+            f"Crosslink with start_epoch {crosslink.start_epoch} did not match the parent"
+            f" crosslink's end epoch {parent_crosslink.end_epoch}."
+        )
+
+    expected_end_epoch = min(
+        target_epoch, parent_crosslink.end_epoch + max_epochs_per_crosslink
+    )
+    if crosslink.end_epoch != expected_end_epoch:
+        raise ValidationError(
+            f"The crosslink did not have the expected end epoch {expected_end_epoch}."
+            f" The end epoch was {crosslink.end_epoch} and the expected was the minimum of"
+            f" the target epoch {target_epoch} or the parent's end epoch plus the"
+            f" max_epochs_per_crosslink {parent_crosslink.end_epoch + max_epochs_per_crosslink}."
+        )
+
+    if crosslink.parent_root != parent_crosslink.hash_tree_root:
+        raise ValidationError(
+            f"The parent root of the crosslink {crosslink.parent_root} did not match the root of"
+            f" the expected parent's crosslink {parent_crosslink.hash_tree_root}."
+        )
+
+    if crosslink.data_root != ZERO_HASH32:
+        raise ValidationError(
+            f"The data root for this crosslink should be the zero hash."
+            f" Instead it was {crosslink.data_root}"
+        )
+
+
+def _validate_attestation_data(
+    state: BeaconState, data: AttestationData, config: Eth2Config
+) -> None:
+    slots_per_epoch = config.SLOTS_PER_EPOCH
+    current_epoch = state.current_epoch(slots_per_epoch)
+    previous_epoch = state.previous_epoch(slots_per_epoch, config.GENESIS_EPOCH)
+
+    attestation_slot = get_attestation_data_slot(state, data, config)
+
+    if data.target.epoch == current_epoch:
+        expected_checkpoint = state.current_justified_checkpoint
+        parent_crosslink = state.current_crosslinks[data.crosslink.shard]
+    else:
+        expected_checkpoint = state.previous_justified_checkpoint
+        parent_crosslink = state.previous_crosslinks[data.crosslink.shard]
+
+    _validate_eligible_shard_number(data.crosslink.shard, config.SHARD_COUNT)
+    _validate_eligible_target_epoch(data.target.epoch, current_epoch, previous_epoch)
+    validate_attestation_slot(
+        attestation_slot,
+        state.slot,
+        slots_per_epoch,
+        config.MIN_ATTESTATION_INCLUSION_DELAY,
+    )
+    _validate_checkpoint(data.source, expected_checkpoint)
+    _validate_crosslink(
+        data.crosslink,
+        data.target.epoch,
+        parent_crosslink,
+        config.MAX_EPOCHS_PER_CROSSLINK,
+    )
+
+
+def validate_attestation(
+    state: BeaconState, attestation: Attestation, config: Eth2Config
+) -> None:
     """
     Validate the given ``attestation``.
     Raise ``ValidationError`` if it's invalid.
     """
-    slots_per_epoch = committee_config.SLOTS_PER_EPOCH
-
-    validate_attestation_slot(
-        attestation.data,
-        state.slot,
-        slots_per_epoch,
-        min_attestation_inclusion_delay,
-        committee_config.GENESIS_SLOT,
-    )
-
-    validate_attestation_justified_epoch(
-        attestation.data,
-        state.current_epoch(slots_per_epoch),
-        state.previous_justified_epoch,
-        state.justified_epoch,
-        slots_per_epoch,
-    )
-
-    validate_attestation_justified_block_root(
-        attestation.data,
-        justified_block_root=get_block_root(
-            state=state,
-            slot=get_epoch_start_slot(
-                attestation.data.justified_epoch,
-                slots_per_epoch,
-            ),
-            latest_block_roots_length=latest_block_roots_length,
-        ),
-    )
-
-    validate_attestation_latest_crosslink_root(
-        attestation_data=attestation.data,
-        state_latest_crosslink=state.latest_crosslinks[attestation.data.shard],
-        slots_per_epoch=slots_per_epoch,
-    )
-
-    validate_attestation_crosslink_data_root(attestation.data)
-
-    validate_attestation_aggregate_signature(
+    _validate_attestation_data(state, attestation.data, config)
+    validate_indexed_attestation(
         state,
-        attestation,
-        committee_config,
+        get_indexed_attestation(state, attestation, CommitteeConfig(config)),
+        config.MAX_VALIDATORS_PER_COMMITTEE,
+        config.SLOTS_PER_EPOCH,
     )
 
 
-def validate_attestation_slot(attestation_data: AttestationData,
-                              state_slot: Slot,
-                              slots_per_epoch: int,
-                              min_attestation_inclusion_delay: int,
-                              genesis_slot: Slot) -> None:
-    """
-    Validate ``slot`` field of ``attestation_data``.
-    Raise ``ValidationError`` if it's invalid.
-    """
-    if attestation_data.slot < genesis_slot:
+#
+# Voluntary Exit validation
+#
+def _validate_validator_is_active(validator: Validator, target_epoch: Epoch) -> None:
+    is_active = validator.is_active(target_epoch)
+    if not is_active:
         raise ValidationError(
-            "Can't submit attestations that are too far in history (or in prehistory):\n"
-            f"\tFound attestation slot: {attestation_data.slot}, "
-            f"needed greater than or equal to `GENESIS_SLOT` ({genesis_slot})"
-        )
-
-    if state_slot >= attestation_data.slot + slots_per_epoch:
-        raise ValidationError(
-            "Attestation slot plus `SLOTS_PER_EPOCH` is too low; "
-            "must exceed the current state:\n"
-            f"\tFound: {attestation_data.slot + slots_per_epoch} "
-            f"({attestation_data.slot} + {slots_per_epoch}), "
-            f"Needed greater than: {state_slot}"
-        )
-
-    if attestation_data.slot + min_attestation_inclusion_delay > state_slot:
-        raise ValidationError(
-            "Can't submit attestations too quickly; attestation slot is greater than "
-            f"current state slot ({state_slot} minus "
-            f"MIN_ATTESTATION_INCLUSION_DELAY ({min_attestation_inclusion_delay}).\n"
-            f"\tFound: {attestation_data.slot}, Needed less than or equal to "
-            f"({state_slot} - {min_attestation_inclusion_delay})"
+            f"Validator trying to exit in {target_epoch} is not active."
         )
 
 
-def validate_attestation_justified_epoch(attestation_data: AttestationData,
-                                         current_epoch: Epoch,
-                                         previous_justified_epoch: Epoch,
-                                         justified_epoch: Epoch,
-                                         slots_per_epoch: int) -> None:
-    """
-    Validate ``justified_epoch`` field of ``attestation_data``.
-    Raise ``ValidationError`` if it's invalid.
-    """
-    if slot_to_epoch(attestation_data.slot + 1, slots_per_epoch) >= current_epoch:
-        if attestation_data.justified_epoch != justified_epoch:
-            raise ValidationError(
-                "Attestation ``slot`` is after recent epoch transition but attestation"
-                "``justified_epoch`` is not targeting the ``justified_epoch``:\n"
-                "\tFound: %s, Expected %s" %
-                (attestation_data.justified_epoch, justified_epoch)
-            )
-    else:
-        if attestation_data.justified_epoch != previous_justified_epoch:
-            raise ValidationError(
-                "Attestation ``slot`` is before recent epoch transition but attestation"
-                "``justified_epoch`` is not targeting the ``previous_justified_epoch:\n"
-                "\tFound: %s, Expected %s" %
-                (attestation_data.justified_epoch, previous_justified_epoch)
-            )
-
-
-def validate_attestation_justified_block_root(attestation_data: AttestationData,
-                                              justified_block_root: Hash32) -> None:
-    """
-    Validate ``justified_block_root`` field of ``attestation_data``.
-    Raise ``ValidationError`` if it's invalid.
-    """
-    if attestation_data.justified_block_root != justified_block_root:
+def _validate_validator_has_not_exited(validator: Validator) -> None:
+    if validator.exit_epoch != FAR_FUTURE_EPOCH:
         raise ValidationError(
-            "Attestation ``justified_block_root`` is not equal to the "
-            "``justified_block_root`` at the ``justified_epoch``:\n"
-            "\tFound: %s, Expected %s at slot %s" %
-            (
-                attestation_data.justified_block_root,
-                justified_block_root,
-                attestation_data.justified_epoch,
-            )
+            f"Validator {validator} in voluntary exit has already exited."
         )
 
 
-def validate_attestation_latest_crosslink_root(attestation_data: AttestationData,
-                                               state_latest_crosslink: CrosslinkRecord,
-                                               slots_per_epoch: int) -> None:
-    """
-    Validate that either the attestation ``latest_crosslink`` or ``crosslink_data_root``
-    field of ``attestation_data`` is the provided ``latest_crosslink``.
-    Raise ``ValidationError`` if it's invalid.
-    """
-    attestation_creating_crosslink = CrosslinkRecord(
-        epoch=slot_to_epoch(attestation_data.slot, slots_per_epoch),
-        crosslink_data_root=attestation_data.crosslink_data_root,
-    )
-    acceptable_crosslink_data = {
-        # Case 1: Latest crosslink matches the one in the state
-        attestation_data.latest_crosslink,
-        # Case 2: State has already been updated, state's latest crosslink matches the crosslink
-        # the attestation is trying to create
-        attestation_creating_crosslink,
-    }
-    if state_latest_crosslink not in acceptable_crosslink_data:
+def _validate_eligible_exit_epoch(exit_epoch: Epoch, current_epoch: Epoch) -> None:
+    if current_epoch < exit_epoch:
         raise ValidationError(
-            f"State's latests crosslink ({state_latest_crosslink}) doesn't match "
-            " case 1: the `attestation_data.latest_crosslink` "
-            f"({attestation_data.latest_crosslink.root}) or "
-            "`case 2: the crosslink the attestation is trying to create "
-            f"({attestation_creating_crosslink})"
+            f"Validator in voluntary exit with exit epoch {exit_epoch}"
+            f" is before the current epoch {current_epoch}."
         )
 
 
-def validate_attestation_crosslink_data_root(attestation_data: AttestationData) -> None:
-    """
-    Validate ``crosslink_data_root`` field of `attestation_data`.
-    Raise ``ValidationError`` if it's invalid.
-
-    Note: This is the Phase 0 version of ``crosslink_data_root`` validation.
-    This is a built-in stub and will be changed in phase 1.
-    """
-    if attestation_data.crosslink_data_root != ZERO_HASH32:
+def _validate_validator_minimum_lifespan(
+    validator: Validator, current_epoch: Epoch, persistent_committee_period: int
+) -> None:
+    if current_epoch < validator.activation_epoch + persistent_committee_period:
         raise ValidationError(
-            "Attestation ``crosslink_data_root`` is not ZERO_HASH32.\n"
-            "\tFound: %s, Expected %s" %
-            (
-                attestation_data.crosslink_data_root,
-                ZERO_HASH32,
-            )
+            f"Validator in voluntary exit has not completed the minimum number of epochs"
+            f" {persistent_committee_period} since activation in {validator.activation_epoch}"
+            f" relative to the current epoch {current_epoch}."
         )
 
 
-@to_tuple
-def get_pubkey_for_indices(validators: Sequence['ValidatorRecord'],
-                           indices: Sequence[ValidatorIndex]) -> Iterable[BLSPubkey]:
-    for index in indices:
-        yield validators[index].pubkey
-
-
-@to_tuple
-def generate_aggregate_pubkeys_from_indices(
-        validators: Sequence['ValidatorRecord'],
-        *indices: Sequence[Sequence['ValidatorIndex']]) -> Iterable[BLSPubkey]:
-    get_pubkeys = functools.partial(get_pubkey_for_indices, validators)
-    return map(
-        bls.aggregate_pubkeys,
-        map(get_pubkeys, indices),
-    )
-
-
-def _validate_custody_bitfield(custody_bitfield: Bitfield) -> None:
-    # TODO: to be removed in phase 1.
-    empty_custody_bitfield = b'\x00' * len(custody_bitfield)
-    if custody_bitfield != empty_custody_bitfield:
-        raise ValidationError(
-            "Attestation custody bitfield is not empty.\n"
-            f"\tFound: {custody_bitfield}, Expected {empty_custody_bitfield}"
-        )
-
-
-def _validate_aggregation_bitfield(aggregation_bitfield: Bitfield) -> None:
-    empty_aggregation_bitfield = b'\x00' * len(aggregation_bitfield)
-    if aggregation_bitfield == empty_aggregation_bitfield:
-        raise ValidationError(
-            "Attestation aggregation bitfield is empty.\n"
-            f"\tFound: {aggregation_bitfield}, Expected some bits set."
-        )
-
-
-def _validate_custody_bitfield_from_aggregation_bitfield(committee_size: int,
-                                                         aggregation_bitfield: Bitfield,
-                                                         custody_bitfield: Bitfield) -> None:
-    """
-    Ensure that every unset bit in the ``aggregation_bitfield`` is also unset
-    in the ``custody_bitfield`` to ensure a canonical representation of information
-    between the two sources of data.
-
-    Raise ``ValidationError`` if there is a mismatch.
-    """
-    for i in range(committee_size):
-        if not bitfield.has_voted(aggregation_bitfield, i):
-            if bitfield.has_voted(custody_bitfield, i):
-                raise ValidationError(
-                    "Invalid attestation bitfields:\n"
-                    f"\tExpected index {i} to not have custody data because "
-                    "they did not participate in this attestation."
-                )
-
-
-def validate_attestation_aggregate_signature(state: BeaconState,
-                                             attestation: Attestation,
-                                             committee_config: CommitteeConfig) -> None:
-    """
-    Validate ``aggregate_signature`` field of ``attestation``.
-    Raise ``ValidationError`` if it's invalid.
-
-    Note: This is the phase 0 version of `aggregate_signature`` validation.
-    All proof of custody bits are assumed to be 0 within the signed data.
-    This will change to reflect real proof of custody bits in the Phase 1.
-    """
-    _validate_custody_bitfield(attestation.custody_bitfield)
-
-    _validate_aggregation_bitfield(attestation.aggregation_bitfield)
-
-    committee = get_crosslink_committee_for_attestation(
-        state=state,
-        attestation_data=attestation.data,
-        committee_config=committee_config,
-    )
-
-    _validate_custody_bitfield_from_aggregation_bitfield(
-        len(committee),
-        attestation.aggregation_bitfield,
-        attestation.custody_bitfield,
-    )
-
-    participants = get_members_from_bitfield(committee, attestation.aggregation_bitfield)
-    custody_bit_1_participants = get_members_from_bitfield(committee, attestation.custody_bitfield)
-    custody_bit_0_participants = (i for i in participants if i not in custody_bit_1_participants)
-
-    pubkeys = generate_aggregate_pubkeys_from_indices(
-        state.validator_registry,
-        custody_bit_0_participants,
-        custody_bit_1_participants,
-    )
-
-    # TODO: change to tree hashing (hash_tree_root) when we have SSZ
-    message_hashes = (
-        AttestationDataAndCustodyBit(data=attestation.data, custody_bit=False).root,
-        AttestationDataAndCustodyBit(data=attestation.data, custody_bit=True).root,
-    )
-
+def _validate_voluntary_exit_signature(
+    state: BeaconState,
+    voluntary_exit: VoluntaryExit,
+    validator: Validator,
+    slots_per_epoch: int,
+) -> None:
     domain = get_domain(
-        fork=state.fork,
-        epoch=slot_to_epoch(attestation.data.slot, committee_config.SLOTS_PER_EPOCH),
-        domain_type=SignatureDomain.DOMAIN_ATTESTATION,
+        state,
+        SignatureDomain.DOMAIN_VOLUNTARY_EXIT,
+        slots_per_epoch,
+        voluntary_exit.epoch,
     )
-
-    is_valid_signature = bls.verify_multiple(
-        pubkeys=pubkeys,
-        message_hashes=message_hashes,
-        signature=attestation.aggregate_signature,
-        domain=domain,
-    )
-
-    if not is_valid_signature:
+    try:
+        bls.validate(
+            pubkey=validator.pubkey,
+            message_hash=voluntary_exit.signing_root,
+            signature=voluntary_exit.signature,
+            domain=domain,
+        )
+    except SignatureError as error:
         raise ValidationError(
-            "Attestation aggregate_signature is invalid. "
-            "message_hashes={}, custody_bit_0_participants={}, custody_bit_1_participants={} "
-            "domain={}".format(
-                message_hashes,
-                custody_bit_0_participants,
-                custody_bit_1_participants,
-                domain,
-            )
+            f"Invalid VoluntaryExit signature, validator_index={voluntary_exit.validator_index}",
+            error,
         )
 
 
-def validate_randao_reveal(randao_reveal: BLSSignature,
-                           proposer_index: ValidatorIndex,
-                           proposer_pubkey: BLSPubkey,
-                           epoch: Epoch,
-                           fork: Fork) -> None:
-    message_hash = Hash32(epoch.to_bytes(32, byteorder="little"))
-    domain = get_domain(fork, epoch, SignatureDomain.DOMAIN_RANDAO)
-
-    is_randao_reveal_valid = bls.verify(
-        pubkey=proposer_pubkey,
-        message_hash=message_hash,
-        signature=randao_reveal,
-        domain=domain,
-    )
-
-    if not is_randao_reveal_valid:
-        raise ValidationError(
-            f"RANDAO reveal is invalid. "
-            f"proposer_index={proposer_index}, proposer_pubkey={proposer_pubkey}, "
-            f"reveal={randao_reveal}, "
-            f"message_hash={message_hash}, domain={domain}, epoch={epoch}"
-        )
-
-
-#
-# Slashable attestation validation
-#
-def verify_slashable_attestation_signature(state: 'BeaconState',
-                                           slashable_attestation: 'SlashableAttestation',
-                                           slots_per_epoch: int) -> bool:
-    """
-    Ensure we have a valid aggregate signature for the ``slashable_attestation``.
-    """
-    all_indices = slashable_attestation.custody_bit_indices
-    pubkeys: Tuple[BLSPubkey, ...] = generate_aggregate_pubkeys_from_indices(
-        state.validator_registry,
-        *all_indices,
-    )
-    message_hashes: Tuple[Hash32, ...] = slashable_attestation.message_hashes
-
-    signature = slashable_attestation.aggregate_signature
-
-    domain = get_domain(
-        state.fork,
-        slot_to_epoch(slashable_attestation.data.slot, slots_per_epoch),
-        SignatureDomain.DOMAIN_ATTESTATION,
-    )
-
-    # No custody bit 1 indice votes in phase 0, so we only need to process custody bit 0
-    # for efficiency.
-    # TODO: to be removed in phase 1.
-    if len(all_indices[1]) == 0:
-        pubkeys = pubkeys[:1]
-        message_hashes = message_hashes[:1]
-
-    return bls.verify_multiple(
-        pubkeys=pubkeys,
-        message_hashes=message_hashes,
-        signature=signature,
-        domain=domain,
-    )
-
-
-def validate_slashable_attestation(state: 'BeaconState',
-                                   slashable_attestation: 'SlashableAttestation',
-                                   max_indices_per_slashable_vote: int,
-                                   slots_per_epoch: int) -> None:
-    """
-    Verify validity of ``slashable_attestation`` fields.
-    Ensure that the ``slashable_attestation`` is properly assembled and contains the signature
-    we expect from the validators we expect. Otherwise, return False as
-    the ``slashable_attestation`` is invalid.
-    """
-    _validate_custody_bitfield(slashable_attestation.custody_bitfield)
-
-    if len(slashable_attestation.validator_indices) == 0:
-        raise ValidationError(
-            "`slashable_attestation.validator_indices` is empty."
-        )
-
-    if not slashable_attestation.are_validator_indices_ascending:
-        raise ValidationError(
-            "`slashable_attestation.validator_indices` "
-            f"({slashable_attestation.validator_indices}) "
-            "is not ordered in ascending."
-        )
-
-    validate_bitfield(
-        slashable_attestation.custody_bitfield,
-        len(slashable_attestation.validator_indices),
-    )
-
-    if len(slashable_attestation.validator_indices) > max_indices_per_slashable_vote:
-        raise ValidationError(
-            f"`len(slashable_attestation.validator_indices)` "
-            f"({len(slashable_attestation.validator_indices)}) greater than "
-            f"MAX_INDICES_PER_SLASHABLE_VOTE ({max_indices_per_slashable_vote})"
-        )
-
-    if not verify_slashable_attestation_signature(state, slashable_attestation, slots_per_epoch):
-        raise ValidationError(
-            f"slashable_attestation.signature error"
-        )
-
-
-#
-# Voluntary Exit
-#
-def validate_voluntary_exit(state: 'BeaconState',
-                            voluntary_exit: 'VoluntaryExit',
-                            slots_per_epoch: int,
-                            activation_exit_delay: int) -> None:
-    validator = state.validator_registry[voluntary_exit.validator_index]
+def validate_voluntary_exit(
+    state: BeaconState,
+    voluntary_exit: VoluntaryExit,
+    slots_per_epoch: int,
+    persistent_committee_period: int,
+) -> None:
+    validator = state.validators[voluntary_exit.validator_index]
     current_epoch = state.current_epoch(slots_per_epoch)
 
-    validate_voluntary_exit_validator_exit_epoch(
-        state,
-        validator,
-        current_epoch,
-        slots_per_epoch=slots_per_epoch,
-        activation_exit_delay=activation_exit_delay,
+    _validate_validator_is_active(validator, current_epoch)
+    _validate_validator_has_not_exited(validator)
+    _validate_eligible_exit_epoch(voluntary_exit.epoch, current_epoch)
+    _validate_validator_minimum_lifespan(
+        validator, current_epoch, persistent_committee_period
+    )
+    _validate_voluntary_exit_signature(
+        state, voluntary_exit, validator, slots_per_epoch
     )
 
-    validate_voluntary_exit_epoch(voluntary_exit, current_epoch)
 
-    validate_voluntary_exit_signature(state, voluntary_exit, validator)
-
-
-def validate_voluntary_exit_validator_exit_epoch(state: 'BeaconState',
-                                                 validator: 'ValidatorRecord',
-                                                 current_epoch: Epoch,
-                                                 slots_per_epoch: int,
-                                                 activation_exit_delay: int) -> None:
-    current_epoch = state.current_epoch(slots_per_epoch)
-
-    # Verify the validator has not yet exited
-    delayed_activation_exit_epoch = get_delayed_activation_exit_epoch(
-        current_epoch,
-        activation_exit_delay,
-    )
-    if validator.exit_epoch <= delayed_activation_exit_epoch:
+def _validate_amount_and_fee_magnitude(state: BeaconState, transfer: Transfer) -> None:
+    threshold = state.balances[transfer.sender]
+    max_amount = max(transfer.amount + transfer.fee, transfer.amount, transfer.fee)
+    if threshold < max_amount:
         raise ValidationError(
-            f"validator.exit_epoch ({validator.exit_epoch}) should be greater than "
-            f"delayed_activation_exit_epoch ({delayed_activation_exit_epoch})"
+            f"Transfer amount (transfer.amount) or fee (transfer.fee) was over the allowable"
+            f" threshold {threshold}."
         )
 
 
-def validate_voluntary_exit_epoch(voluntary_exit: 'VoluntaryExit',
-                                  current_epoch: Epoch) -> None:
-    # Exits must specify an epoch when they become valid; they are not valid before then
-    if current_epoch < voluntary_exit.epoch:
+def _validate_transfer_slot(state_slot: Slot, transfer_slot: Slot) -> None:
+    if state_slot != transfer_slot:
         raise ValidationError(
-            f"voluntary_exit.epoch ({voluntary_exit.epoch}) should be less than or equal to "
-            f"current epoch ({current_epoch})"
+            f"Transfer is only valid in the specified slot {transfer_slot} but the state is at"
+            f" {state_slot}."
         )
 
 
-def validate_voluntary_exit_signature(state: 'BeaconState',
-                                      voluntary_exit: 'VoluntaryExit',
-                                      validator: 'ValidatorRecord') -> None:
-    domain = get_domain(state.fork, voluntary_exit.epoch, SignatureDomain.DOMAIN_EXIT)
-    is_valid_signature = bls.verify(
-        pubkey=validator.pubkey,
-        message_hash=voluntary_exit.signed_root,
-        signature=voluntary_exit.signature,
-        domain=domain,
+def _validate_sender_eligibility(
+    state: BeaconState, transfer: Transfer, config: Eth2Config
+) -> None:
+    current_epoch = state.current_epoch(config.SLOTS_PER_EPOCH)
+    sender = state.validators[transfer.sender]
+    sender_balance = state.balances[transfer.sender]
+
+    eligible_for_activation = sender.activation_eligibility_epoch != FAR_FUTURE_EPOCH
+    is_withdrawable = current_epoch >= sender.withdrawable_epoch
+    is_transfer_total_allowed = (
+        transfer.amount + transfer.fee + config.MAX_EFFECTIVE_BALANCE <= sender_balance
     )
 
-    if not is_valid_signature:
+    if (not eligible_for_activation) or is_withdrawable or is_transfer_total_allowed:
+        return
+
+    if eligible_for_activation:
         raise ValidationError(
-            f"Invalid VoluntaryExit signature, validator_index={voluntary_exit.validator_index}, "
-            f"pubkey={validator.pubkey}, message_hash={voluntary_exit.signed_root},"
-            f"signature={voluntary_exit.signature}, domain={domain}"
+            f"Sender in transfer {transfer} is eligible for activation."
         )
+
+    if not is_withdrawable:
+        raise ValidationError(f"Sender in transfer {transfer} is not withdrawable.")
+
+    if not is_transfer_total_allowed:
+        raise ValidationError(
+            f"Sender does not have sufficient funds in transfer {transfer}."
+        )
+
+
+def _validate_sender_pubkey(
+    state: BeaconState, transfer: Transfer, config: Eth2Config
+) -> None:
+    sender = state.validators[transfer.sender]
+    expected_withdrawal_credentials = (
+        config.BLS_WITHDRAWAL_PREFIX.to_bytes(1, byteorder="little")
+        + hash_eth2(transfer.pubkey)[1:]
+    )
+    are_withdrawal_credentials_valid = (
+        sender.withdrawal_credentials == expected_withdrawal_credentials
+    )
+
+    if not are_withdrawal_credentials_valid:
+        raise ValidationError(
+            f"Pubkey in transfer {transfer} does not match the withdrawal credentials"
+            f" {expected_withdrawal_credentials} for validator {sender}."
+        )
+
+
+def _validate_transfer_signature(
+    state: BeaconState, transfer: Transfer, config: Eth2Config
+) -> None:
+    domain = get_domain(state, SignatureDomain.DOMAIN_TRANSFER, config.SLOTS_PER_EPOCH)
+    try:
+        bls.validate(
+            pubkey=transfer.pubkey,
+            message_hash=transfer.signing_root,
+            signature=transfer.signature,
+            domain=domain,
+        )
+    except SignatureError as error:
+        raise ValidationError(f"Invalid signature for transfer {transfer}", error)
+
+
+def _validate_transfer_does_not_result_in_dust(
+    state: BeaconState, transfer: Transfer, config: Eth2Config
+) -> None:
+    resulting_sender_balance = max(
+        0, state.balances[transfer.sender] - (transfer.amount + transfer.fee)
+    )
+    resulting_sender_balance_is_dust = (
+        0 < resulting_sender_balance < config.MIN_DEPOSIT_AMOUNT
+    )
+    if resulting_sender_balance_is_dust:
+        raise ValidationError(
+            f"Effect of transfer {transfer} results in dust balance for sender."
+        )
+
+    resulting_recipient_balance = state.balances[transfer.recipient] + transfer.amount
+    resulting_recipient_balance_is_dust = (
+        0 < resulting_recipient_balance < config.MIN_DEPOSIT_AMOUNT
+    )
+    if resulting_recipient_balance_is_dust:
+        raise ValidationError(
+            f"Effect of transfer {transfer} results in dust balance for recipient."
+        )
+
+
+def validate_transfer(
+    state: BeaconState, transfer: Transfer, config: Eth2Config
+) -> None:
+    _validate_amount_and_fee_magnitude(state, transfer)
+    _validate_transfer_slot(state.slot, transfer.slot)
+    _validate_sender_eligibility(state, transfer, config)
+    _validate_sender_pubkey(state, transfer, config)
+    _validate_transfer_signature(state, transfer, config)
+    _validate_transfer_does_not_result_in_dust(state, transfer, config)

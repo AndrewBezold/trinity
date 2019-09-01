@@ -1,5 +1,6 @@
 from typing import (
     List,
+    NamedTuple,
     Tuple,
     TYPE_CHECKING,
     Union,
@@ -10,15 +11,21 @@ from eth_typing import (
     BlockNumber,
 )
 
+from eth_utils import ValidationError
+
+from lahja import EndpointAPI
+
 from eth.rlp.headers import BlockHeader
 from eth.rlp.receipts import Receipt
 from eth.rlp.transactions import BaseTransactionFields
 
-from p2p.protocol import (
-    Protocol,
+from lahja import (
+    BroadcastConfig,
 )
 
-from trinity.protocol.common.peer import ChainInfo
+from p2p.abc import NodeAPI
+from p2p.protocol import Protocol
+
 from trinity.rlp.block_body import BlockBody
 
 from .commands import (
@@ -35,6 +42,13 @@ from .commands import (
     Status,
     Transactions,
 )
+from .events import (
+    SendBlockBodiesEvent,
+    SendBlockHeadersEvent,
+    SendNodeDataEvent,
+    SendReceiptsEvent,
+    SendTransactionsEvent,
+)
 
 from trinity._utils.logging import HasExtendedDebugLogger
 
@@ -42,29 +56,48 @@ if TYPE_CHECKING:
     from .peer import ETHPeer  # noqa: F401
 
 
+class ETHHandshakeParams(NamedTuple):
+    head_hash: Hash32
+    genesis_hash: Hash32
+    network_id: int
+    total_difficulty: int
+    version: int
+
+
 # HasExtendedDebugLogger must come before Protocol so there's self.logger.debug2()
 class ETHProtocol(HasExtendedDebugLogger, Protocol):
     name = 'eth'
     version = 63
-    _commands = [
-        Status, NewBlockHashes, Transactions, GetBlockHeaders, BlockHeaders,
-        GetBlockBodies, BlockBodies, NewBlock, GetNodeData, NodeData,
-        GetReceipts, Receipts]
+    _commands = (
+        Status,
+        NewBlockHashes,
+        Transactions,
+        GetBlockHeaders, BlockHeaders,
+        GetBlockBodies, BlockBodies,
+        NewBlock,
+        GetNodeData, NodeData,
+        GetReceipts, Receipts,
+    )
     cmd_length = 17
 
     peer: 'ETHPeer'
 
-    def send_handshake(self, chain_info: ChainInfo) -> None:
+    def send_handshake(self, handshake_params: ETHHandshakeParams) -> None:
+        if handshake_params.version != self.version:
+            raise ValidationError(
+                f"ETH protocol version mismatch: "
+                f"params:{handshake_params.version} != proto:{self.version}"
+            )
         resp = {
-            'protocol_version': self.version,
-            'network_id': self.peer.network_id,
-            'td': chain_info.total_difficulty,
-            'best_hash': chain_info.block_hash,
-            'genesis_hash': chain_info.genesis_hash,
+            'protocol_version': handshake_params.version,
+            'network_id': handshake_params.network_id,
+            'td': handshake_params.total_difficulty,
+            'best_hash': handshake_params.head_hash,
+            'genesis_hash': handshake_params.genesis_hash,
         }
         cmd = Status(self.cmd_id_offset, self.snappy_support)
         self.logger.debug2("Sending ETH/Status msg: %s", resp)
-        self.send(*cmd.encode(resp))
+        self.transport.send(*cmd.encode(resp))
 
     #
     # Node Data
@@ -72,12 +105,12 @@ class ETHProtocol(HasExtendedDebugLogger, Protocol):
     def send_get_node_data(self, node_hashes: Tuple[Hash32, ...]) -> None:
         cmd = GetNodeData(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(node_hashes)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     def send_node_data(self, nodes: Tuple[bytes, ...]) -> None:
         cmd = NodeData(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(nodes)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     #
     # Block Headers
@@ -102,12 +135,12 @@ class ETHProtocol(HasExtendedDebugLogger, Protocol):
             'reverse': reverse
         }
         header, body = cmd.encode(data)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     def send_block_headers(self, headers: Tuple[BlockHeader, ...]) -> None:
         cmd = BlockHeaders(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(headers)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     #
     # Block Bodies
@@ -115,12 +148,12 @@ class ETHProtocol(HasExtendedDebugLogger, Protocol):
     def send_get_block_bodies(self, block_hashes: Tuple[Hash32, ...]) -> None:
         cmd = GetBlockBodies(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(block_hashes)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     def send_block_bodies(self, blocks: List[BlockBody]) -> None:
         cmd = BlockBodies(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(blocks)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     #
     # Receipts
@@ -128,12 +161,12 @@ class ETHProtocol(HasExtendedDebugLogger, Protocol):
     def send_get_receipts(self, block_hashes: Tuple[Hash32, ...]) -> None:
         cmd = GetReceipts(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(block_hashes)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     def send_receipts(self, receipts: List[List[Receipt]]) -> None:
         cmd = Receipts(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(receipts)
-        self.send(header, body)
+        self.transport.send(header, body)
 
     #
     # Transactions
@@ -141,4 +174,84 @@ class ETHProtocol(HasExtendedDebugLogger, Protocol):
     def send_transactions(self, transactions: List[BaseTransactionFields]) -> None:
         cmd = Transactions(self.cmd_id_offset, self.snappy_support)
         header, body = cmd.encode(transactions)
-        self.send(header, body)
+        self.transport.send(header, body)
+
+
+class ProxyETHProtocol:
+    """
+    An ``ETHProtocol`` that can be used outside of the process that runs the peer pool. Any
+    action performed on this class is delegated to the process that runs the peer pool.
+    """
+
+    def __init__(self,
+                 remote: NodeAPI,
+                 event_bus: EndpointAPI,
+                 broadcast_config: BroadcastConfig):
+        self.remote = remote
+        self._event_bus = event_bus
+        self._broadcast_config = broadcast_config
+
+    def send_handshake(self, handshake_params: ETHHandshakeParams) -> None:
+        raise NotImplementedError("`ProxyETHProtocol.send_handshake` Not yet implemented")
+
+    #
+    # Node Data
+    #
+    def send_get_node_data(self, node_hashes: Tuple[Hash32, ...]) -> None:
+        raise NotImplementedError("Not yet implemented")
+
+    def send_node_data(self, nodes: Tuple[bytes, ...]) -> None:
+        self._event_bus.broadcast_nowait(
+            SendNodeDataEvent(self.remote, nodes),
+            self._broadcast_config,
+        )
+
+    #
+    # Block Headers
+    #
+    def send_get_block_headers(
+            self,
+            block_number_or_hash: Union[BlockNumber, Hash32],
+            max_headers: int,
+            skip: int,
+            reverse: bool) -> None:
+        raise NotImplementedError("Not yet implemented")
+
+    def send_block_headers(self, headers: Tuple[BlockHeader, ...]) -> None:
+        self._event_bus.broadcast_nowait(
+            SendBlockHeadersEvent(self.remote, headers),
+            self._broadcast_config,
+        )
+
+    #
+    # Block Bodies
+    #
+    def send_get_block_bodies(self, block_hashes: Tuple[Hash32, ...]) -> None:
+        raise NotImplementedError("Not yet implemented")
+
+    def send_block_bodies(self, blocks: List[BlockBody]) -> None:
+        self._event_bus.broadcast_nowait(
+            SendBlockBodiesEvent(self.remote, blocks),
+            self._broadcast_config,
+        )
+
+    #
+    # Receipts
+    #
+    def send_get_receipts(self, block_hashes: Tuple[Hash32, ...]) -> None:
+        raise NotImplementedError("Not yet implemented")
+
+    def send_receipts(self, receipts: List[List[Receipt]]) -> None:
+        self._event_bus.broadcast_nowait(
+            SendReceiptsEvent(self.remote, receipts),
+            self._broadcast_config,
+        )
+
+    #
+    # Transactions
+    #
+    def send_transactions(self, transactions: List[BaseTransactionFields]) -> None:
+        self._event_bus.broadcast_nowait(
+            SendTransactionsEvent(self.remote, transactions),
+            self._broadcast_config,
+        )

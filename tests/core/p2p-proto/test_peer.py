@@ -2,8 +2,7 @@ import asyncio
 
 import pytest
 
-from p2p.exceptions import NoMatchingPeerCapabilities
-from p2p.p2p_proto import DisconnectReason, P2PProtocol
+from p2p.disconnect import DisconnectReason
 
 from trinity.protocol.eth.peer import ETHPeer
 from trinity.protocol.eth.proto import ETHProtocol
@@ -13,95 +12,67 @@ from trinity.protocol.les.proto import (
     LESProtocolV2,
 )
 
+from trinity.tools.factories import (
+    ETHPeerPairFactory,
+    LESV1PeerPairFactory,
+    LESV2PeerPairFactory,
+)
+
 from tests.core.peer_helpers import (
-    get_directly_linked_peers_without_handshake,
-    get_directly_linked_peers,
     MockPeerPoolWithConnectedPeers,
 )
 
 
-@pytest.mark.parametrize(
-    'peer_class,proto',
-    (
-        (LESPeer, LESProtocolV2),
-        (ETHPeer, ETHProtocol),
-    )
-)
 @pytest.mark.asyncio
-async def test_directly_linked_peers(request, event_loop, peer_class, proto):
-    peer1, _ = await get_directly_linked_peers(request, event_loop, alice_peer_class=peer_class)
-    assert isinstance(peer1.sub_proto, proto)
+async def test_LES_v1_peers():
+    async with LESV1PeerPairFactory() as (alice, bob):
+        assert isinstance(alice, LESPeer)
+        assert isinstance(bob, LESPeer)
+
+        assert isinstance(alice.sub_proto, LESProtocol)
+        assert isinstance(bob.sub_proto, LESProtocol)
 
 
 @pytest.mark.asyncio
-async def test_les_handshake():
-    peer1, peer2 = await get_directly_linked_peers_without_handshake(alice_peer_class=LESPeer)
+async def test_LES_v2_peers():
+    async with LESV2PeerPairFactory() as (alice, bob):
+        assert isinstance(alice, LESPeer)
+        assert isinstance(bob, LESPeer)
 
-    # Perform the base protocol (P2P) handshake.
-    await asyncio.gather(peer1.do_p2p_handshake(), peer2.do_p2p_handshake())
-    # Perform the handshake for the enabled sub-protocol (LES).
-    await asyncio.gather(peer1.do_sub_proto_handshake(), peer2.do_sub_proto_handshake())
-
-    assert isinstance(peer1.sub_proto, LESProtocol)
-    assert isinstance(peer2.sub_proto, LESProtocol)
+        assert isinstance(alice.sub_proto, LESProtocolV2)
+        assert isinstance(bob.sub_proto, LESProtocolV2)
 
 
-@pytest.mark.parametrize(
-    'snappy_support',
-    (
-        True,
-        False,
-    )
-)
-def test_sub_protocol_selection(snappy_support):
-    peer = ProtoMatchingPeer([LESProtocol, LESProtocolV2], snappy_support)
+@pytest.mark.asyncio
+async def test_ETH_peers():
+    async with ETHPeerPairFactory() as (alice, bob):
+        assert isinstance(alice, ETHPeer)
+        assert isinstance(bob, ETHPeer)
 
-    proto = peer.select_sub_protocol([
-        (LESProtocol.name, LESProtocol.version),
-        (LESProtocolV2.name, LESProtocolV2.version),
-        (LESProtocolV3.name, LESProtocolV3.version),
-        ('unknown', 1),
-    ],
-        snappy_support=snappy_support
-    )
-
-    assert isinstance(proto, LESProtocolV2)
-    assert proto.cmd_id_offset == peer.base_protocol.cmd_length
-
-    with pytest.raises(NoMatchingPeerCapabilities):
-        peer.select_sub_protocol([('unknown', 1)], snappy_support)
+        assert isinstance(alice.sub_proto, ETHProtocol)
+        assert isinstance(bob.sub_proto, ETHProtocol)
 
 
 @pytest.mark.asyncio
 async def test_peer_pool_iter(request, event_loop):
-    peer1, _ = await get_directly_linked_peers(request, event_loop)
-    peer2, _ = await get_directly_linked_peers(request, event_loop)
-    peer3, _ = await get_directly_linked_peers(request, event_loop)
-    pool = MockPeerPoolWithConnectedPeers([peer1, peer2, peer3])
-    peers = list([peer async for peer in pool])
+    factory_a = ETHPeerPairFactory()
+    factory_b = ETHPeerPairFactory()
+    factory_c = ETHPeerPairFactory()
+    async with factory_a as (peer1, _), factory_b as (peer2, _), factory_c as (peer3, _):
+        pool = MockPeerPoolWithConnectedPeers([peer1, peer2, peer3])
+        peers = list([peer async for peer in pool])
 
-    assert len(peers) == 3
-    assert peer1 in peers
-    assert peer2 in peers
-    assert peer3 in peers
+        assert len(peers) == 3
+        assert peer1 in peers
+        assert peer2 in peers
+        assert peer3 in peers
 
-    peers = []
-    asyncio.ensure_future(peer2.disconnect(DisconnectReason.disconnect_requested))
-    async for peer in pool:
-        peers.append(peer)
+        peers = []
+        asyncio.ensure_future(peer2.disconnect(DisconnectReason.disconnect_requested))
+        async for peer in pool:
+            peers.append(peer)
 
-    assert len(peers) == 2
-    assert peer1 in peers
-    assert peer2 not in peers
-    assert peer3 in peers
-
-
-class LESProtocolV3(LESProtocol):
-    version = 3
-
-
-class ProtoMatchingPeer(LESPeer):
-
-    def __init__(self, supported_sub_protocols, snappy_support):
-        self._supported_sub_protocols = supported_sub_protocols
-        self.base_protocol = P2PProtocol(self, snappy_support)
+        assert len(peers) == 2
+        assert peer1 in peers
+        assert peer2 not in peers
+        assert peer3 in peers

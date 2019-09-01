@@ -1,7 +1,3 @@
-import asyncio
-
-from cancel_token import CancelToken
-
 from eth_utils import (
     to_tuple,
 )
@@ -14,44 +10,36 @@ from eth.constants import (
 )
 from eth.db.atomic import AtomicDB
 
-from eth2.beacon.db.chain import BeaconChainDB
 from eth2.beacon.types.blocks import (
     BeaconBlock,
     BeaconBlockBody,
 )
-from eth2.beacon.types.eth1_data import (
-    Eth1Data,
-)
 
-from trinity.protocol.bcc.context import BeaconContext
-from trinity.protocol.bcc.peer import (
-    BCCPeerFactory,
-    BCCPeerPool,
-)
-
-from p2p import ecies
-from p2p.tools.paragon.helpers import (
-    get_directly_linked_peers_without_handshake as _get_directly_linked_peers_without_handshake,
-    get_directly_linked_peers as _get_directly_linked_peers,
-)
 from eth2.beacon.constants import (
     EMPTY_SIGNATURE,
 )
+from eth2.beacon.fork_choice.higher_slot import higher_slot_scoring
+from eth2.beacon.state_machines.forks.serenity import SERENITY_CONFIG
+from eth2.configs import (
+    Eth2GenesisConfig,
+)
+
+from trinity.db.beacon.chain import AsyncBeaconChainDB
+
+SERENITY_GENESIS_CONFIG = Eth2GenesisConfig(SERENITY_CONFIG)
 
 
-def create_test_block(parent=None, **kwargs):
+def create_test_block(parent=None, genesis_config=SERENITY_GENESIS_CONFIG, **kwargs):
     defaults = {
-        "slot": 0,
+        "slot": genesis_config.GENESIS_SLOT,
         "parent_root": ZERO_HASH32,
         "state_root": ZERO_HASH32,  # note: not the actual genesis state root
-        "randao_reveal": EMPTY_SIGNATURE,
-        "eth1_data": Eth1Data.create_empty_data(),
         "signature": EMPTY_SIGNATURE,
-        "body": BeaconBlockBody.create_empty_body()
+        "body": BeaconBlockBody(),
     }
 
     if parent is not None:
-        kwargs["parent_root"] = parent.root
+        kwargs["parent_root"] = parent.signing_root
         kwargs["slot"] = parent.slot + 1
 
     return BeaconBlock(**merge(defaults, kwargs))
@@ -63,7 +51,7 @@ def create_branch(length, root=None, **start_kwargs):
         return
 
     if root is None:
-        root = create_test_block(slot=0)
+        root = create_test_block()
 
     parent = create_test_block(parent=root, **start_kwargs)
     yield parent
@@ -74,98 +62,19 @@ def create_branch(length, root=None, **start_kwargs):
         parent = child
 
 
-def get_chain_db(blocks=()):
+async def get_chain_db(blocks=(),
+                       genesis_config=SERENITY_GENESIS_CONFIG,
+                       fork_choice_scoring=higher_slot_scoring):
     db = AtomicDB()
-    chain_db = BeaconChainDB(db)
-    chain_db.persist_block_chain(blocks, BeaconBlock)
+    chain_db = AsyncBeaconChainDB(db=db, genesis_config=genesis_config)
+    await chain_db.coro_persist_block_chain(
+        blocks,
+        BeaconBlock,
+        (higher_slot_scoring,) * len(blocks),
+    )
     return chain_db
 
 
-def get_genesis_chain_db():
-    genesis = create_test_block(slot=0)
-    return get_chain_db((genesis,))
-
-
-async def _setup_alice_and_bob_factories(alice_chain_db, bob_chain_db):
-    cancel_token = CancelToken('trinity.get_directly_linked_peers_without_handshake')
-
-    #
-    # Alice
-    #
-    alice_context = BeaconContext(
-        chain_db=alice_chain_db,
-        network_id=1,
-    )
-
-    alice_factory = BCCPeerFactory(
-        privkey=ecies.generate_privkey(),
-        context=alice_context,
-        token=cancel_token,
-    )
-
-    #
-    # Bob
-    #
-    bob_context = BeaconContext(
-        chain_db=bob_chain_db,
-        network_id=1,
-    )
-
-    bob_factory = BCCPeerFactory(
-        privkey=ecies.generate_privkey(),
-        context=bob_context,
-        token=cancel_token,
-    )
-
-    return alice_factory, bob_factory
-
-
-async def get_directly_linked_peers_without_handshake(alice_chain_db, bob_chain_db):
-    alice_factory, bob_factory = await _setup_alice_and_bob_factories(alice_chain_db, bob_chain_db)
-
-    return await _get_directly_linked_peers_without_handshake(
-        alice_factory=alice_factory,
-        bob_factory=bob_factory,
-    )
-
-
-async def get_directly_linked_peers(request, event_loop, alice_chain_db, bob_chain_db):
-    alice_factory, bob_factory = await _setup_alice_and_bob_factories(
-        alice_chain_db,
-        bob_chain_db,
-    )
-
-    return await _get_directly_linked_peers(
-        request,
-        event_loop,
-        alice_factory=alice_factory,
-        bob_factory=bob_factory,
-    )
-
-
-async def get_directly_linked_peers_in_peer_pools(request,
-                                                  event_loop,
-                                                  alice_chain_db,
-                                                  bob_chain_db):
-    alice, bob = await get_directly_linked_peers(
-        request,
-        event_loop,
-        alice_chain_db=alice_chain_db,
-        bob_chain_db=bob_chain_db,
-    )
-    alice_peer_pool = BCCPeerPool(alice.privkey, alice.context)
-    bob_peer_pool = BCCPeerPool(bob.privkey, bob.context)
-
-    asyncio.ensure_future(alice_peer_pool.run())
-    asyncio.ensure_future(bob_peer_pool.run())
-
-    def finalizer():
-        event_loop.run_until_complete(alice_peer_pool.cancel())
-        event_loop.run_until_complete(bob_peer_pool.cancel())
-
-    request.addfinalizer(finalizer)
-
-    alice_peer_pool._add_peer(alice, [])
-    bob_peer_pool._add_peer(bob, [])
-
-    return alice, alice_peer_pool, bob, bob_peer_pool
+async def get_genesis_chain_db(genesis_config=SERENITY_GENESIS_CONFIG):
+    genesis = create_test_block(genesis_config=genesis_config)
+    return await get_chain_db((genesis,), genesis_config=genesis_config)

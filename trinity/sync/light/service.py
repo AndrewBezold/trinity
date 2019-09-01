@@ -21,7 +21,7 @@ from async_lru import alru_cache
 import rlp
 
 from eth_typing import (
-    Address,
+    Address as ETHAddress,
     Hash32,
 )
 
@@ -44,27 +44,26 @@ from eth.rlp.accounts import Account
 from eth.rlp.headers import BlockHeader
 from eth.rlp.receipts import Receipt
 
+from p2p.abc import CommandAPI
 from p2p.exceptions import (
     BadLESResponse,
     NoConnectedPeers,
     NoEligiblePeers,
 )
-from p2p import protocol
 from p2p.constants import (
     COMPLETION_TIMEOUT,
     MAX_REORG_DEPTH,
     MAX_REQUEST_ATTEMPTS,
     REPLY_TIMEOUT,
 )
-from p2p.p2p_proto import (
-    DisconnectReason,
-)
+from p2p.disconnect import DisconnectReason
 from p2p.peer import PeerSubscriber
 from p2p.protocol import Command
 from p2p.service import (
     BaseService,
     service_timeout,
 )
+from p2p.typing import Payload
 
 from trinity.db.eth1.header import BaseAsyncHeaderDB
 from trinity.protocol.les.peer import LESPeer, LESPeerPool
@@ -75,23 +74,23 @@ class BaseLightPeerChain(ABC):
 
     @abstractmethod
     async def coro_get_block_header_by_hash(self, block_hash: Hash32) -> BlockHeader:
-        pass
+        ...
 
     @abstractmethod
     async def coro_get_block_body_by_hash(self, block_hash: Hash32) -> BlockBody:
-        pass
+        ...
 
     @abstractmethod
     async def coro_get_receipts(self, block_hash: Hash32) -> List[Receipt]:
-        pass
+        ...
 
     @abstractmethod
-    async def coro_get_account(self, block_hash: Hash32, address: Address) -> Account:
-        pass
+    async def coro_get_account(self, block_hash: Hash32, address: ETHAddress) -> Account:
+        ...
 
     @abstractmethod
-    async def coro_get_contract_code(self, block_hash: Hash32, address: Address) -> bytes:
-        pass
+    async def coro_get_contract_code(self, block_hash: Hash32, address: ETHAddress) -> bytes:
+        ...
 
 
 class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
@@ -107,10 +106,10 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         BaseService.__init__(self, token)
         self.headerdb = headerdb
         self.peer_pool = peer_pool
-        self._pending_replies: Dict[int, Callable[[protocol._DecodedMsgType], None]] = {}
+        self._pending_replies: Dict[int, Callable[[Payload], None]] = {}
 
     # TODO: be more specific about what messages we want.
-    subscription_msg_types: FrozenSet[Type[Command]] = frozenset({Command})
+    subscription_msg_types: FrozenSet[Type[CommandAPI]] = frozenset({Command})
 
     # Here we only care about replies to our requests, ignoring most msgs (which are supposed
     # to be handled by the chain syncer), so our queue should never grow too much.
@@ -134,9 +133,9 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         reply = None
         got_reply = asyncio.Event()
 
-        def callback(r: protocol._DecodedMsgType) -> None:
+        def callback(value: Payload) -> None:
             nonlocal reply
-            reply = r
+            reply = value
             got_reply.set()
 
         self._pending_replies[request_id] = callback
@@ -190,7 +189,7 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
 
     @alru_cache(maxsize=1024, cache_exceptions=False)
     @service_timeout(COMPLETION_TIMEOUT)
-    async def coro_get_account(self, block_hash: Hash32, address: Address) -> Account:
+    async def coro_get_account(self, block_hash: Hash32, address: ETHAddress) -> Account:
         return await self._retry_on_bad_response(
             partial(self._get_account_from_peer, block_hash, address)
         )
@@ -198,7 +197,7 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
     async def _get_account_from_peer(
             self,
             block_hash: Hash32,
-            address: Address,
+            address: ETHAddress,
             peer: LESPeer) -> Account:
         key = keccak(address)
         proof = await self._get_proof(peer, block_hash, account_key=b'', key=key)
@@ -206,16 +205,15 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         try:
             rlp_account = HexaryTrie.get_from_proof(header.state_root, key, proof)
         except BadTrieProof as exc:
-            raise BadLESResponse("Peer %s returned an invalid proof for account %s at block %s" % (
-                peer,
-                encode_hex(address),
-                encode_hex(block_hash),
-            )) from exc
+            raise BadLESResponse(
+                f"Peer {peer} returned an invalid proof for account {encode_hex(address)} "
+                f"at block {encode_hex(block_hash)}"
+            ) from exc
         return rlp.decode(rlp_account, sedes=Account)
 
     @alru_cache(maxsize=1024, cache_exceptions=False)
     @service_timeout(COMPLETION_TIMEOUT)
-    async def coro_get_contract_code(self, block_hash: Hash32, address: Address) -> bytes:
+    async def coro_get_contract_code(self, block_hash: Hash32, address: ETHAddress) -> bytes:
         """
         :param block_hash: find code as of the block with block_hash
         :param address: which contract to look up
@@ -230,7 +228,9 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         try:
             account = await self.coro_get_account(block_hash, address)
         except HeaderNotFound as exc:
-            raise NoEligiblePeers("Our best peer does not have header %s" % block_hash) from exc
+            raise NoEligiblePeers(
+                f"Our best peer does not have header {block_hash}"
+            ) from exc
 
         code_hash = account.code_hash
 
@@ -241,7 +241,7 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
     async def _get_contract_code_from_peer(
             self,
             block_hash: Hash32,
-            address: Address,
+            address: ETHAddress,
             code_hash: Hash32,
             peer: LESPeer) -> bytes:
         """
@@ -268,17 +268,15 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
             raise RuntimeError("Unreachable, _raise_for_empty_code must raise its own exception")
         else:
             # a bad-acting peer sent an invalid non-empty bytecode
-            raise BadLESResponse("Peer %s sent code %s that did not match hash %s in account %s" % (
-                peer,
-                encode_hex(bytecode),
-                encode_hex(code_hash),
-                encode_hex(address),
-            ))
+            raise BadLESResponse(
+                "Peer {peer} sent code {encode_hex(bytecode)} that did not match "
+                f"hash {encode_hex(code_hash)} in account {encode_hex(address)}"
+            )
 
     async def _raise_for_empty_code(
             self,
             block_hash: Hash32,
-            address: Address,
+            address: ETHAddress,
             code_hash: Hash32,
             peer: LESPeer) -> None:
         """
@@ -296,42 +294,35 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         except HeaderNotFound:
             # We presume that the current peer is the best peer. Because
             # our best peer doesn't have the header we want, there are no eligible peers.
-            raise NoEligiblePeers("Our best peer does not have the header %s" % block_hash)
+            raise NoEligiblePeers(f"Our best peer does not have the header {block_hash}")
 
         head_number = peer.head_number
         if head_number - header.block_number > MAX_REORG_DEPTH:
             # The peer claims to be far ahead of the header we requested
-            if self.headerdb.get_canonical_block_hash(header.block_number) == block_hash:
+            if await self.headerdb.coro_get_canonical_block_hash(header.block_number) == block_hash:
                 # Our node believes that the header at the reference hash is canonical,
                 # so treat the peer as malicious
                 raise BadLESResponse(
-                    "Peer %s sent empty code that did not match hash %s in account %s" % (
-                        peer,
-                        encode_hex(code_hash),
-                        encode_hex(address),
-                    )
+                    f"Peer {peer} sent empty code that did not match hash {encode_hex(code_hash)} "
+                    f"in account {encode_hex(address)}"
                 )
             else:
                 # our header isn't canonical, so treat the empty response as missing data
                 raise NoEligiblePeers(
-                    "Our best peer does not have the non-canonical header %s" % block_hash
+                    f"Our best peer does not have the non-canonical header {block_hash}"
                 )
         elif head_number - header.block_number < 0:
             # The peer claims to be behind the header we requested, but somehow served it to us.
             # Odd, it might be a race condition. Treat as if there are no eligible peers for now.
-            raise NoEligiblePeers("Our best peer's head does include header %s" % block_hash)
+            raise NoEligiblePeers(f"Our best peer's head does include header {block_hash}")
         else:
             # The peer is ahead of the current block header, but only by a bit. It might be on
             # an uncle, or we might be. So we can't tell the difference between missing and
             # malicious. We don't want to aggressively drop this peer, so treat the code as missing.
             raise NoEligiblePeers(
-                "Peer %s claims to be ahead of %s, but returned empty code with hash %s. "
-                "It is on number %d, maybe an uncle. Retry with an older block hash." % (
-                    peer,
-                    header,
-                    code_hash,
-                    head_number,
-                )
+                f"Peer {peer} claims to be ahead of {header}, but "
+                f"returned empty code with hash {code_hash}. "
+                f"It is on number {head_number}, maybe an uncle. Retry with an older block hash."
             )
 
     async def _get_block_header_by_hash(self, block_hash: Hash32, peer: LESPeer) -> BlockHeader:
@@ -356,8 +347,9 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
         header = headers[0]
         if header.hash != block_hash:
             raise BadLESResponse(
-                "Received header hash (%s) does not match what we requested (%s)",
-                header.hex_hash, encode_hex(block_hash))
+                f"Received header hash ({header.hex_hash}) does not "
+                f"match what we requested ({encode_hex(block_hash)})"
+            )
         return header
 
     async def _get_proof(self,
@@ -392,4 +384,4 @@ class LightPeerChain(PeerSubscriber, BaseService, BaseLightPeerChain):
                 await peer.disconnect(DisconnectReason.subprotocol_error)
                 # reattempt after removing this peer from our pool
 
-        raise TimeoutError("Could not complete peer request in %d attempts" % MAX_REQUEST_ATTEMPTS)
+        raise TimeoutError(f"Could not complete peer request in {MAX_REQUEST_ATTEMPTS} attempts")

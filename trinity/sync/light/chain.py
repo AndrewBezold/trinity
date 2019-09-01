@@ -3,7 +3,7 @@ from cancel_token import CancelToken
 
 from p2p.service import BaseService
 
-from trinity.chains.base import BaseAsyncChain
+from trinity.chains.base import AsyncChainAPI
 from trinity.db.eth1.header import BaseAsyncHeaderDB
 from trinity.protocol.les.peer import LESPeerPool
 from trinity.protocol.les.sync import LightHeaderChainSyncer
@@ -12,13 +12,13 @@ from trinity._utils.timer import Timer
 
 class LightChainSyncer(BaseService):
     def __init__(self,
-                 chain: BaseAsyncChain,
+                 chain: AsyncChainAPI,
                  db: BaseAsyncHeaderDB,
                  peer_pool: LESPeerPool,
                  token: CancelToken = None) -> None:
         super().__init__(token=token)
         self._db = db
-        self._header_syncer = LightHeaderChainSyncer(chain, db, peer_pool, self.cancel_token)
+        self._header_syncer = LightHeaderChainSyncer(chain, db, peer_pool, token=self.cancel_token)
 
     async def _run(self) -> None:
         self.run_daemon(self._header_syncer)

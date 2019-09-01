@@ -4,17 +4,17 @@
 from argparse import ArgumentParser, _SubParsersAction
 import asyncio
 
-from p2p.events import PeerCountRequest
+from lahja import EndpointAPI
+
 from p2p.service import BaseService
-from lahja import Endpoint
-from trinity.endpoint import TrinityEventBusEndpoint
-from trinity.extensibility import BaseIsolatedPlugin
-from trinity._utils.shutdown import exit_with_service_and_endpoint
+from trinity.extensibility import AsyncioIsolatedPlugin
+from trinity.protocol.common.events import PeerCountRequest
+from trinity._utils.shutdown import exit_with_services
 
 
 class PeerCountReporter(BaseService):
 
-    def __init__(self, event_bus: TrinityEventBusEndpoint) -> None:
+    def __init__(self, event_bus: EndpointAPI) -> None:
         super().__init__()
         self.event_bus = event_bus
 
@@ -35,13 +35,14 @@ class PeerCountReporter(BaseService):
             await asyncio.sleep(5)
 
 
-class PeerCountReporterPlugin(BaseIsolatedPlugin):
+class PeerCountReporterPlugin(AsyncioIsolatedPlugin):
 
     @property
     def name(self) -> str:
         return "Peer Count Reporter"
 
-    def configure_parser(self,
+    @classmethod
+    def configure_parser(cls,
                          arg_parser: ArgumentParser,
                          subparser: _SubParsersAction) -> None:
         arg_parser.add_argument(
@@ -50,14 +51,11 @@ class PeerCountReporterPlugin(BaseIsolatedPlugin):
             help="Report peer count to console",
         )
 
-    def on_ready(self, manager_eventbus: TrinityEventBusEndpoint) -> None:
-        if self.context.args.report_peer_count:
+    def on_ready(self, manager_eventbus: EndpointAPI) -> None:
+        if self.boot_info.args.report_peer_count:
             self.start()
 
     def do_start(self) -> None:
-        loop = asyncio.get_event_loop()
         service = PeerCountReporter(self.event_bus)
-        asyncio.ensure_future(exit_with_service_and_endpoint(service, self.event_bus))
+        asyncio.ensure_future(exit_with_services(service, self._event_bus_service))
         asyncio.ensure_future(service.run())
-        loop.run_forever()
-        loop.close()

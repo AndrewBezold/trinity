@@ -10,14 +10,15 @@ Table of contents
 
    introduction
    quickstart
-   release_notes/index
+   release_notes
 
 .. toctree::
    :maxdepth: 1
    :caption: Fundamentals
 
-   guides/index
    api/index
+   cookbook
+   guides/index
 
 .. toctree::
    :maxdepth: 1

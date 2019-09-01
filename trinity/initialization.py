@@ -1,17 +1,26 @@
 import os
+from typing import Type
 
-from eth.db.backends.base import BaseAtomicDB
+from eth.abc import (
+    AtomicDatabaseAPI,
+    ChainDatabaseAPI,
+)
 from eth.exceptions import CanonicalHeadNotFound
 
 from p2p import ecies
 
 from trinity.config import (
     BeaconAppConfig,
+    BeaconChainConfig,
     Eth1AppConfig,
-    ChainConfig,
+    Eth1ChainConfig,
     TrinityConfig,
 )
-from trinity.db.eth1.chain import BaseAsyncChainDB
+
+from eth2.beacon.types.blocks import (
+    BaseBeaconBlock,
+)
+from eth2.beacon.db.chain import BaseBeaconChainDB
 from trinity.exceptions import (
     MissingPath,
 )
@@ -52,9 +61,20 @@ def is_data_dir_initialized(trinity_config: TrinityConfig) -> bool:
     return True
 
 
-def is_database_initialized(chaindb: BaseAsyncChainDB) -> bool:
+def is_database_initialized(chaindb: ChainDatabaseAPI) -> bool:
     try:
         chaindb.get_canonical_head()
+    except CanonicalHeadNotFound:
+        # empty chain database
+        return False
+    else:
+        return True
+
+
+def is_beacon_database_initialized(chaindb: BaseBeaconChainDB,
+                                   block_class: Type[BaseBeaconBlock]) -> bool:
+    try:
+        chaindb.get_canonical_head(block_class)
     except CanonicalHeadNotFound:
         # empty chain database
         return False
@@ -79,7 +99,15 @@ def initialize_data_dir(trinity_config: TrinityConfig) -> None:
     # Logfile
     should_create_logdir = (
         not trinity_config.log_dir.exists() and
-        is_under_path(trinity_config.trinity_root_dir, trinity_config.log_dir)
+        (
+            # If we're in the default path, always create the log directory
+            is_under_path(trinity_config.trinity_root_dir, trinity_config.log_dir) or
+            (
+                # If we're in a custom path, create the log directory if the data dir is empty
+                is_under_path(trinity_config.data_dir, trinity_config.log_dir) and
+                not any(trinity_config.data_dir.iterdir())
+            )
+        )
     )
     if should_create_logdir:
         trinity_config.log_dir.mkdir(parents=True, exist_ok=True)
@@ -104,11 +132,21 @@ def initialize_data_dir(trinity_config: TrinityConfig) -> None:
             nodekey_file.write(nodekey.to_bytes())
 
 
-def initialize_database(chain_config: ChainConfig,
-                        chaindb: BaseAsyncChainDB,
-                        base_db: BaseAtomicDB) -> None:
+def initialize_database(chain_config: Eth1ChainConfig,
+                        chaindb: ChainDatabaseAPI,
+                        base_db: AtomicDatabaseAPI) -> None:
     try:
         chaindb.get_canonical_head()
+    except CanonicalHeadNotFound:
+        chain_config.initialize_chain(base_db)
+
+
+def initialize_beacon_database(chain_config: BeaconChainConfig,
+                               chaindb: BaseBeaconChainDB,
+                               base_db: AtomicDatabaseAPI,
+                               block_class: Type[BaseBeaconBlock]) -> None:
+    try:
+        chaindb.get_canonical_head(block_class)
     except CanonicalHeadNotFound:
         chain_config.initialize_chain(base_db)
 

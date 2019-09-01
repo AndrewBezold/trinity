@@ -1,58 +1,46 @@
-from eth_typing import (
-    Hash32,
-)
-
+from eth.constants import ZERO_HASH32
+from eth_typing import Hash32
+from eth_utils import humanize_hash
 import ssz
-from ssz.sedes import (
-    uint64,
-    bytes32,
-)
+from ssz.sedes import bytes32
 
-from eth2.beacon.typing import (
-    Epoch,
-    Slot,
-    Shard,
-)
-from eth2.beacon.types.crosslink_records import CrosslinkRecord
+from eth2.beacon.types.checkpoints import Checkpoint, default_checkpoint
+from eth2.beacon.types.crosslinks import Crosslink, default_crosslink
 
 
 class AttestationData(ssz.Serializable):
 
     fields = [
-        # Slot number
-        ('slot', uint64),
-        # Shard number
-        ('shard', uint64),
-        # Hash of the signed beacon block
-        ('beacon_block_root', bytes32),
-        # Hash of the ancestor at the epoch boundary
-        ('epoch_boundary_root', bytes32),
-        # Shard block root being attested to
-        ('crosslink_data_root', bytes32),
-        # Last crosslink hash
-        ('latest_crosslink', CrosslinkRecord),
-        # epoch of the last justified beacon block
-        ('justified_epoch', uint64),
-        # Hash of the last justified beacon block
-        ('justified_block_root', bytes32),
+        # LMD GHOST vote
+        ("beacon_block_root", bytes32),
+        # FFG vote
+        ("source", Checkpoint),
+        ("target", Checkpoint),
+        # Crosslink vote
+        ("crosslink", Crosslink),
     ]
 
-    def __init__(self,
-                 slot: Slot,
-                 shard: Shard,
-                 beacon_block_root: Hash32,
-                 epoch_boundary_root: Hash32,
-                 crosslink_data_root: Hash32,
-                 latest_crosslink: CrosslinkRecord,
-                 justified_epoch: Epoch,
-                 justified_block_root: Hash32) -> None:
+    def __init__(
+        self,
+        beacon_block_root: Hash32 = ZERO_HASH32,
+        source: Checkpoint = default_checkpoint,
+        target: Checkpoint = default_checkpoint,
+        crosslink: Crosslink = default_crosslink,
+    ) -> None:
         super().__init__(
-            slot,
-            shard,
-            beacon_block_root,
-            epoch_boundary_root,
-            crosslink_data_root,
-            latest_crosslink,
-            justified_epoch,
-            justified_block_root,
+            beacon_block_root=beacon_block_root,
+            source=source,
+            target=target,
+            crosslink=crosslink,
         )
+
+    def __str__(self) -> str:
+        return (
+            f"beacon_block_root={humanize_hash(self.beacon_block_root)[2:10]}"
+            f" source={self.source}"
+            f" target={self.target}"
+            f" | CL={self.crosslink}"
+        )
+
+
+default_attestation_data = AttestationData()

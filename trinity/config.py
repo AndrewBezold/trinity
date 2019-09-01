@@ -3,51 +3,70 @@ from abc import (
     abstractmethod,
 )
 import argparse
-from contextlib import contextmanager
+from contextlib import (
+    contextmanager,
+)
 from enum import (
-    auto,
     Enum,
+    auto,
 )
 import json
-from pathlib import Path
+from pathlib import (
+    Path,
+)
 from typing import (
+    TYPE_CHECKING,
     Any,
-    cast,
     Dict,
     Iterable,
-    TYPE_CHECKING,
+    NamedTuple,
     Tuple,
     Type,
     TypeVar,
     Union,
+    cast,
 )
 
+from eth.abc import (
+    AtomicDatabaseAPI,
+)
+from eth.typing import (
+    VMConfiguration,
+)
+from eth_keys import (
+    keys,
+)
+from eth_keys.datatypes import (
+    PrivateKey,
+)
 from eth_typing import (
     Address,
+    BLSPubkey,
 )
 
-from eth_keys import keys
-from eth_keys.datatypes import PrivateKey
+from multiaddr import (
+    Multiaddr,
+)
 
-from eth.db.backends.base import BaseAtomicDB
-from eth.typing import VMConfiguration
-
-from p2p.kademlia import Node as KademliaNode
+from eth2.beacon.chains.testnet import (
+    TestnetChain,
+)
+from eth2.beacon.genesis import (
+    get_genesis_block,
+)
+from eth2.beacon.types.states import BeaconState
+from eth2.beacon.typing import (
+    Timestamp,
+)
+from eth2.configs import (
+    Eth2GenesisConfig,
+)
 from p2p.constants import (
     MAINNET_BOOTNODES,
     ROPSTEN_BOOTNODES,
 )
-
-from trinity.constants import (
-    ASSETS_DIR,
-    DEFAULT_PREFERRED_NODES,
-    IPC_DIR,
-    LOG_DIR,
-    LOG_FILE,
-    MAINNET_NETWORK_ID,
-    PID_DIR,
-    ROPSTEN_NETWORK_ID,
-    SYNC_LIGHT,
+from p2p.kademlia import (
+    Node as KademliaNode,
 )
 from trinity._utils.chains import (
     construct_trinity_config_params,
@@ -69,6 +88,27 @@ from trinity._utils.filesystem import (
 from trinity._utils.xdg import (
     get_xdg_trinity_root,
 )
+from trinity.constants import (
+    ASSETS_DIR,
+    DEFAULT_PREFERRED_NODES,
+    IPC_DIR,
+    LOG_DIR,
+    LOG_FILE,
+    MAINNET_NETWORK_ID,
+    PID_DIR,
+    ROPSTEN_NETWORK_ID,
+    SYNC_LIGHT,
+)
+from trinity.plugins.eth2.beacon.utils import (
+    extract_genesis_state_from_stream,
+    extract_privkeys_from_dir,
+)
+from trinity.plugins.eth2.constants import (
+    VALIDATOR_KEY_DIR,
+)
+from trinity.plugins.eth2.network_generator.constants import (
+    GENESIS_FILE,
+)
 
 
 if TYPE_CHECKING:
@@ -76,6 +116,8 @@ if TYPE_CHECKING:
     from trinity.nodes.base import Node  # noqa: F401
     from trinity.chains.full import FullChain  # noqa: F401
     from trinity.chains.light import LightDispatchChain  # noqa: F401
+    from eth2.beacon.chains.base import BeaconChain  # noqa: F401
+    from eth2.beacon.state_machines.base import BaseBeaconStateMachine  # noqa: F401
 
 DATABASE_DIR_NAME = 'chain'
 
@@ -106,7 +148,7 @@ def _get_preconfigured_chain_name(network_id: int) -> str:
         raise TypeError(f"Unknown or unsupported `network_id`: {network_id}")
 
 
-class ChainConfig:
+class Eth1ChainConfig:
     def __init__(self,
                  genesis_data: GenesisData,
                  chain_name: str=None) -> None:
@@ -145,7 +187,7 @@ class ChainConfig:
     def from_eip1085_genesis_config(cls,
                                     genesis_config: Dict[str, Any],
                                     chain_name: str=None,
-                                    ) -> 'ChainConfig':
+                                    ) -> 'Eth1ChainConfig':
         genesis_data = extract_genesis_data(genesis_config)
         return cls(
             genesis_data=genesis_data,
@@ -154,7 +196,7 @@ class ChainConfig:
 
     @classmethod
     def from_preconfigured_network(cls,
-                                   network_id: int) -> 'ChainConfig':
+                                   network_id: int) -> 'Eth1ChainConfig':
         genesis_config = _load_preconfigured_genesis_config(network_id)
         chain_name = _get_preconfigured_chain_name(network_id)
         return cls.from_eip1085_genesis_config(genesis_config, chain_name)
@@ -175,7 +217,7 @@ class ChainConfig:
         return self.genesis_data.state
 
     def initialize_chain(self,
-                         base_db: BaseAtomicDB) -> 'FullChain':
+                         base_db: AtomicDatabaseAPI) -> 'FullChain':
         genesis_params = self.genesis_params.to_dict()
         genesis_state = {
             address: account.to_dict()
@@ -200,9 +242,18 @@ TAppConfig = TypeVar('TAppConfig', bound='BaseAppConfig')
 
 
 class TrinityConfig:
+    """
+    The :class:`~trinity.config.TrinityConfig` holds all base configurations that are generic
+    enough to be shared across the different runtime modes that are available. It also gives access
+    to the more specific application configurations derived from
+    :class:`~trinity.config.BaseAppConfig`.
+
+    This API is exposed to :class:`~trinity.extensibility.plugin.BasePlugin`
+    """
+
     _trinity_root_dir: Path = None
 
-    _chain_config: ChainConfig = None
+    _chain_config: Eth1ChainConfig = None
 
     _data_dir: Path = None
     _nodekey_path: Path = None
@@ -267,6 +318,8 @@ class TrinityConfig:
                 self.bootstrap_nodes = tuple(
                     KademliaNode.from_uri(enode) for enode in ROPSTEN_BOOTNODES
                 )
+            else:
+                self.bootstrap_nodes = tuple()
         else:
             self.bootstrap_nodes = bootstrap_nodes
 
@@ -280,16 +333,13 @@ class TrinityConfig:
         elif nodekey is not None:
             self.nodekey = nodekey
 
-    def get_chain_config(self) -> ChainConfig:
-        # the `ChainConfig` object cannot be pickled so we can't cache this
-        # value since the TrinityConfig is sent across process boundaries.
-        if self.network_id in PRECONFIGURED_NETWORKS:
-            return ChainConfig.from_preconfigured_network(self.network_id)
-        else:
-            return ChainConfig.from_eip1085_genesis_config(self.genesis_config)
-
     @property
     def app_suffix(self) -> str:
+        """
+        Return the suffix that Trinity uses to derive various application directories depending
+        on the current mode of operation (e.g. ``eth1`` or ``beacon`` to derive
+        ``<trinity-root-dir>/mainnet/logs-eth1`` vs ``<trinity-root-dir>/mainnet/logs-beacon``)
+        """
         return "" if len(self.app_identifier) == 0 else f"-{self.app_identifier}"
 
     @property
@@ -309,26 +359,7 @@ class TrinityConfig:
     @property
     def trinity_root_dir(self) -> Path:
         """
-        The trinity_root_dir is the base directory that all trinity data is
-        stored under.
-
-        The default ``data_dir`` path will be resolved relative to this
-        directory.
-        """
-        if self._trinity_root_dir is not None:
-            return self._trinity_root_dir
-        else:
-            return get_xdg_trinity_root()
-
-    @trinity_root_dir.setter
-    def trinity_root_dir(self, value: str) -> None:
-        self._trinity_root_dir = Path(value).resolve()
-
-    @property
-    def trinity_root_dir(self) -> Path:
-        """
-        The trinity_root_dir is the base directory that all trinity data is
-        stored under.
+        Base directory that all trinity data is stored under.
 
         The default ``data_dir`` path will be resolved relative to this
         directory.
@@ -363,28 +394,28 @@ class TrinityConfig:
     @property
     def database_ipc_path(self) -> Path:
         """
-        Path for the database IPC socket connection.
+        Return the path for the database IPC socket connection.
         """
         return get_database_socket_path(self.ipc_dir)
 
     @property
     def ipc_dir(self) -> Path:
         """
-        The base directory for all open IPC files.
+        Return the base directory for all open IPC files.
         """
         return self.with_app_suffix(self.data_dir / IPC_DIR)
 
     @property
     def pid_dir(self) -> Path:
         """
-        The base directory for all PID files.
+        Return the base directory for all PID files.
         """
         return self.with_app_suffix(self.data_dir / PID_DIR)
 
     @property
     def jsonrpc_ipc_path(self) -> Path:
         """
-        Path for the JSON-RPC server IPC socket.
+        Return the path for the JSON-RPC server IPC socket.
         """
         return get_jsonrpc_socket_path(self.ipc_dir)
 
@@ -407,6 +438,10 @@ class TrinityConfig:
 
     @property
     def nodekey(self) -> PrivateKey:
+        """
+        The :class:`~eth_keys.datatypes.PrivateKey` which trinity uses to derive the
+        public key needed to identify itself on the network.
+        """
         if self._nodekey is None:
             try:
                 return load_nodekey(self.nodekey_path)
@@ -434,6 +469,16 @@ class TrinityConfig:
 
     @contextmanager
     def process_id_file(self, process_name: str):  # type: ignore
+        """
+        Context manager API to generate process identification files (pid) in the current
+        :meth:`pid_dir`.
+
+        .. code-block:: python
+
+            trinity_config.process_id_file('networking'):
+                ... # pid file sitting in pid directory while process is running
+            ... # pid file cleaned up
+        """
         with PidFile(process_name, self.pid_dir):
             yield
 
@@ -443,8 +488,8 @@ class TrinityConfig:
                          app_identifier: str,
                          app_config_types: Iterable[Type['BaseAppConfig']]) -> 'TrinityConfig':
         """
-        Helper function for initializing from the namespace object produced by
-        an ``argparse.ArgumentParser``
+        Initialize a :class:`~trinity.config.TrinityConfig` from the namespace object produced by
+        an :class:`~argparse.ArgumentParser`.
         """
         constructor_kwargs = construct_trinity_config_params(parser_args)
         trinity_config = cls(app_identifier=app_identifier, **constructor_kwargs)
@@ -457,8 +502,9 @@ class TrinityConfig:
                                parser_args: argparse.Namespace,
                                app_config_types: Iterable[Type['BaseAppConfig']]) -> None:
         """
-        Initialize all available ``BaseAppConfig`` based on their concrete types,
-        the ``parser_args`` and the existing ``TrinityConfig`` instance.
+        Initialize :class:`~trinity.config.BaseAppConfig` instances for the passed
+        ``app_config_types`` based on the ``parser_args`` and the existing
+        :class:`~trinity.config.TrintiyConfig` instance.
         """
         for app_config_type in app_config_types:
             self.add_app_config(app_config_type.from_parser_args(parser_args, self))
@@ -471,19 +517,24 @@ class TrinityConfig:
 
     def has_app_config(self, app_config_type: Type['BaseAppConfig']) -> bool:
         """
-        Check if a ``BaseAppConfig`` exists based on the given ``app_config_type``.
+        Check if a :class:`~trinity.config.BaseAppConfig` instance exists that matches the given
+        ``app_config_type``.
         """
         return app_config_type in self._app_configs.keys()
 
     def get_app_config(self, app_config_type: Type[TAppConfig]) -> TAppConfig:
         """
-        Return the ``BaseAppConfig`` derived instance based on the given ``app_config_type``.
+        Return the registered :class:`~trinity.config.BaseAppConfig` instance that matches
+        the given ``app_config_type``.
         """
         # We want this API to return the specific type of the app config that is requested.
         # Our backing field only knows that it is holding `BaseAppConfig`'s but not concrete types
         return cast(TAppConfig, self._app_configs[app_config_type])
 
     def with_app_suffix(self, path: Path) -> Path:
+        """
+        Return a :class:`~pathlib.Path` that matches the given ``path`` plus the :meth:`app_suffix`
+        """
         return path.with_name(path.name + self.app_suffix)
 
 
@@ -499,7 +550,7 @@ class BaseAppConfig(ABC):
                          trinity_config: TrinityConfig) -> 'BaseAppConfig':
         """
         Initialize from the namespace object produced by
-        an ``argparse.ArgumentParser`` and the ``TrinityConfig``
+        an ``argparse.ArgumentParser`` and the :class:`~trinity.config.TrinityConfig`
         """
         pass
 
@@ -521,12 +572,16 @@ class Eth1AppConfig(BaseAppConfig):
     def from_parser_args(cls,
                          args: argparse.Namespace,
                          trinity_config: TrinityConfig) -> 'BaseAppConfig':
+        """
+        Initialize from the namespace object produced by
+        an ``argparse.ArgumentParser`` and the :class:`~trinity.config.TrinityConfig`
+        """
         return cls(trinity_config, args.sync_mode)
 
     @property
     def database_dir(self) -> Path:
         """
-        Path where the chain database will be stored.
+        Path where the chain database is stored.
 
         This is resolved relative to the ``data_dir``
         """
@@ -540,15 +595,30 @@ class Eth1AppConfig(BaseAppConfig):
 
     @property
     def database_mode(self) -> Eth1DbMode:
+        """
+        Return the :class:`~trinity.config.Eth1DbMode` for the currently used database
+        """
         if self.sync_mode == SYNC_LIGHT:
             return Eth1DbMode.LIGHT
         else:
             return Eth1DbMode.FULL
 
-    @property
-    def node_class(self) -> Type['Node']:
+    def get_chain_config(self) -> Eth1ChainConfig:
         """
-        The ``Node`` class that trinity will use.
+        Return the :class:`~trinity.config.Eth1ChainConfig` either derived from the ``network_id``
+        or a custom genesis file.
+        """
+        # the `ChainConfig` object cannot be pickled so we can't cache this
+        # value since the TrinityConfig is sent across process boundaries.
+        if self.trinity_config.network_id in PRECONFIGURED_NETWORKS:
+            return Eth1ChainConfig.from_preconfigured_network(self.trinity_config.network_id)
+        else:
+            return Eth1ChainConfig.from_eip1085_genesis_config(self.trinity_config.genesis_config)
+
+    @property
+    def node_class(self) -> Type['Node[Any]']:
+        """
+        Return the ``Node`` class that trinity uses.
         """
         from trinity.nodes.full import FullNode
         from trinity.nodes.light import LightNode
@@ -562,12 +632,101 @@ class Eth1AppConfig(BaseAppConfig):
 
     @property
     def sync_mode(self) -> str:
+        """
+        Return the currently used sync mode
+        """
         return self._sync_mode
 
+
+class BeaconGenesisData(NamedTuple):
+    """
+    Use this data to initialize BeaconChainConfig
+    """
+    genesis_time: Timestamp
+    # TODO: Should come from eth2.beacon.genesis.get_genesis_beacon_state
+    state: BeaconState
+    # TODO: Trinity should have no knowledge of validators' private keys
+    validator_keymap: Dict[BLSPubkey, int]
+    # TODO: Maybe Validator deposit data
+
+
+class BeaconChainConfig:
+    network_id: int
+    genesis_data: BeaconGenesisData
+    _chain_name: str
+    _beacon_chain_class: Type['BeaconChain'] = None
+    _genesis_config: Eth2GenesisConfig = None
+
+    def __init__(self,
+                 chain_name: str=None,
+                 genesis_data: BeaconGenesisData=None) -> None:
+
+        self.network_id = 5567
+        self.genesis_data = genesis_data
+
+        self._chain_name = chain_name
+
     @property
-    def nodedb_path(self) -> Path:
-        config = self.trinity_config
-        return config.with_app_suffix(config.data_dir / "nodedb")
+    def genesis_config(self) -> Eth2GenesisConfig:
+        if self._genesis_config is None:
+            self._genesis_config = Eth2GenesisConfig(
+                self.beacon_chain_class.get_genesis_state_machine_class().config,
+            )
+
+        return self._genesis_config
+
+    @property
+    def chain_name(self) -> str:
+        if self._chain_name is None:
+            return "CustomBeaconChain"
+        else:
+            return self._chain_name
+
+    @property
+    def beacon_chain_class(self) -> Type['BeaconChain']:
+        if self._beacon_chain_class is None:
+            # TODO: we should be able to customize configs for tests/ instead of using the configs
+            #   from `TestnetChain`
+            self._beacon_chain_class = TestnetChain.configure(
+                __name__=self.chain_name,
+            )
+        return self._beacon_chain_class
+
+    @classmethod
+    def from_genesis_files(cls,
+                           root_dir: Path,
+                           chain_name: str=None) -> 'BeaconChainConfig':
+        # parse `genesis_state`
+        genesis_file_path = root_dir / GENESIS_FILE
+        state = extract_genesis_state_from_stream(genesis_file_path)
+        # parse privkeys and build `validator_keymap`
+        keys_path = root_dir / VALIDATOR_KEY_DIR
+        validator_keymap = extract_privkeys_from_dir(keys_path)
+        # set `genesis_data`
+        genesis_data = BeaconGenesisData(
+            genesis_time=state.genesis_time,
+            state=state,
+            validator_keymap=validator_keymap,
+        )
+        return cls(
+            genesis_data=genesis_data,
+            chain_name=chain_name,
+        )
+
+    def initialize_chain(self,
+                         base_db: AtomicDatabaseAPI) -> 'BeaconChain':
+        chain_class = self.beacon_chain_class
+        state = self.genesis_data.state
+        block = get_genesis_block(
+            genesis_state_root=state.hash_tree_root,
+            block_class=chain_class.get_genesis_state_machine_class().block_class,
+        )
+        return chain_class.from_genesis(
+            base_db=base_db,
+            genesis_state=state,
+            genesis_block=block,
+            genesis_config=self.genesis_config,
+        )
 
 
 class BeaconAppConfig(BaseAppConfig):
@@ -576,14 +735,35 @@ class BeaconAppConfig(BaseAppConfig):
     def from_parser_args(cls,
                          args: argparse.Namespace,
                          trinity_config: TrinityConfig) -> 'BaseAppConfig':
+        """
+        Initialize from the namespace object produced by
+        an ``argparse.ArgumentParser`` and the :class:`~trinity.config.TrinityConfig`
+        """
+        if args is not None:
+            # This is quick and dirty way to get bootstrap_nodes
+            trinity_config.bootstrap_nodes = tuple(
+                Multiaddr(maddr) for maddr in args.bootstrap_nodes.split(',')
+            ) if args.bootstrap_nodes is not None else tuple()
+            trinity_config.preferred_nodes = tuple(
+                Multiaddr(maddr) for maddr in args.preferred_nodes.split(',')
+            ) if args.preferred_nodes is not None else tuple()
         return cls(trinity_config)
 
     @property
     def database_dir(self) -> Path:
         """
-        Path where the chain database will be stored.
+        Return the path where the chain database is stored.
 
         This is resolved relative to the ``data_dir``
         """
         path = self.trinity_config.data_dir / DATABASE_DIR_NAME
         return self.trinity_config.with_app_suffix(path) / "full"
+
+    def get_chain_config(self) -> BeaconChainConfig:
+        """
+        Return the :class:`~trinity.config.BeaconChainConfig` that is derived from the genesis file
+        """
+        return BeaconChainConfig.from_genesis_files(
+            root_dir=self.trinity_config.trinity_root_dir,
+            chain_name="TestnetChain",
+        )

@@ -4,7 +4,12 @@ from pathlib import Path
 import tempfile
 import uuid
 
+from async_generator import (
+    asynccontextmanager,
+)
 import pytest
+
+from lahja import AsyncioEndpoint
 
 from eth_utils import (
     decode_hex,
@@ -16,7 +21,7 @@ from eth_keys import keys
 from eth import constants as eth_constants
 from eth.chains.base import (
     Chain,
-    MiningChain,
+    MiningChain
 )
 from eth.db.atomic import AtomicDB
 # TODO: tests should not be locked into one set of VM rules.  Look at expanding
@@ -36,9 +41,6 @@ from trinity.constants import (
 )
 from trinity.chains.coro import (
     AsyncChainMixin,
-)
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
 )
 from trinity.initialization import (
     ensure_eth1_dirs,
@@ -114,7 +116,7 @@ def event_loop():
 # This fixture provides a tear down to run after each test that uses it.
 # This ensures the AsyncProcessRunner will never leave a process behind
 @pytest.fixture(scope="function")
-def async_process_runner(event_loop):
+def async_process_runner():
     runner = AsyncProcessRunner(
         # This allows running pytest with -s and observing the output
         debug_fn=lambda line: print(line)
@@ -126,21 +128,29 @@ def async_process_runner(event_loop):
         pass
 
 
-@pytest.fixture(scope='module')
-async def event_bus(event_loop):
-    endpoint = TrinityEventBusEndpoint()
+@asynccontextmanager
+async def make_networking_event_bus():
     # Tests run concurrently, therefore we need unique IPC paths
     ipc_path = Path(f"networking-{uuid.uuid4()}.ipc")
     networking_connection_config = ConnectionConfig(
         name=NETWORKING_EVENTBUS_ENDPOINT,
         path=ipc_path
     )
-    await endpoint.start_serving(networking_connection_config, event_loop)
-    await endpoint.connect_to_endpoints(networking_connection_config)
-    try:
+    async with AsyncioEndpoint.serve(networking_connection_config) as endpoint:
         yield endpoint
-    finally:
-        endpoint.stop()
+
+
+@pytest.fixture
+async def event_bus():
+    async with make_networking_event_bus() as endpoint:
+        yield endpoint
+
+
+# Tests with multiple peers require us to give each of them there independent 'networking' endpoint
+@pytest.fixture
+async def other_event_bus():
+    async with make_networking_event_bus() as endpoint:
+        yield endpoint
 
 
 @pytest.fixture(scope='session')
@@ -204,7 +214,7 @@ def _chain_with_block_validation(base_db, genesis_state, chain_cls=Chain):
         "extra_data": b"B",
         "gas_limit": 3141592,
         "gas_used": 0,
-        "mix_hash": decode_hex("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),  # noqa: E501
+        "mix_hash": decode_hex("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
         "nonce": decode_hex("0102030405060708"),
         "block_number": 0,
         "parent_hash": decode_hex("0000000000000000000000000000000000000000000000000000000000000000"),  # noqa: E501
@@ -251,9 +261,8 @@ def genesis_state(base_genesis_state):
     return base_genesis_state
 
 
-@pytest.fixture(params=[Chain, MiningChain])
+@pytest.fixture
 def chain_without_block_validation(
-        request,
         base_db,
         genesis_state):
     """
@@ -271,8 +280,7 @@ def chain_without_block_validation(
         'validate_block': lambda self, block: None,
     }
     SpuriousDragonVMForTesting = SpuriousDragonVM.configure(validate_seal=lambda block: None)
-    chain_class = request.param
-    klass = chain_class.configure(
+    klass = MiningChain.configure(
         __name__='TestChainWithoutBlockValidation',
         vm_configuration=(
             (eth_constants.GENESIS_BLOCK_NUMBER, SpuriousDragonVMForTesting),
@@ -308,7 +316,9 @@ async def ipc_server(
     the course of all tests. It yields the IPC server only for monkeypatching purposes
     """
     rpc = RPCServer(
-        initialize_eth1_modules(chain_with_block_validation, event_bus)
+        initialize_eth1_modules(chain_with_block_validation, event_bus),
+        chain_with_block_validation,
+        event_bus,
     )
     ipc_server = IPCServer(rpc, jsonrpc_ipc_pipe_path, loop=event_loop)
 

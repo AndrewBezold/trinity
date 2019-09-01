@@ -1,37 +1,67 @@
-from eth_typing import (
-    Hash32,
-)
+from typing import Sequence, Tuple
 
-from eth2._utils.merkle import get_merkle_root
-from eth2.beacon.configs import (
-    BeaconConfig,
-)
+from eth.constants import ZERO_HASH32
+from eth_typing import Hash32
+from eth_utils import ValidationError
+
+from eth2._utils.tuple import update_tuple_item
 from eth2.beacon.types.states import BeaconState
+from eth2.beacon.typing import Slot
+from eth2.configs import Eth2Config
+
+from .epoch_processing import process_epoch
 
 
-def process_slot_transition(state: BeaconState,
-                            config: BeaconConfig,
-                            previous_block_root: Hash32) -> BeaconState:
-    latest_block_roots_length = config.LATEST_BLOCK_ROOTS_LENGTH
+def _update_historical_root(
+    roots: Tuple[Hash32, ...],
+    index: Slot,
+    slots_per_historical_root: int,
+    new_root: Hash32,
+) -> Sequence[Hash32]:
+    return update_tuple_item(roots, index % slots_per_historical_root, new_root)
 
-    # Update state.slot
-    state = state.copy(
-        slot=state.slot + 1
+
+def _process_slot(state: BeaconState, config: Eth2Config) -> BeaconState:
+    slots_per_historical_root = config.SLOTS_PER_HISTORICAL_ROOT
+
+    previous_state_root = state.hash_tree_root
+    updated_state_roots = _update_historical_root(
+        state.state_roots, state.slot, slots_per_historical_root, previous_state_root
     )
 
-    # Update state.latest_block_roots
-    updated_latest_block_roots = list(state.latest_block_roots)
-    previous_block_root_index = (state.slot - 1) % latest_block_roots_length
-    updated_latest_block_roots[previous_block_root_index] = previous_block_root
+    if state.latest_block_header.state_root == ZERO_HASH32:
+        latest_block_header = state.latest_block_header
+        state = state.copy(
+            latest_block_header=latest_block_header.copy(state_root=previous_state_root)
+        )
 
-    # Update state.batched_block_roots
-    updated_batched_block_roots = state.batched_block_roots
-    if state.slot % latest_block_roots_length == 0:
-        updated_batched_block_roots += (get_merkle_root(updated_latest_block_roots),)
-
-    state = state.copy(
-        latest_block_roots=tuple(updated_latest_block_roots),
-        batched_block_roots=updated_batched_block_roots,
+    updated_block_roots = _update_historical_root(
+        state.block_roots,
+        state.slot,
+        slots_per_historical_root,
+        state.latest_block_header.signing_root,
     )
+
+    return state.copy(block_roots=updated_block_roots, state_roots=updated_state_roots)
+
+
+def _increment_slot(state: BeaconState) -> BeaconState:
+    return state.copy(slot=state.slot + 1)
+
+
+def process_slots(state: BeaconState, slot: Slot, config: Eth2Config) -> BeaconState:
+    if state.slot > slot:
+        raise ValidationError(
+            f"Requested a slot transition at {slot}, behind the current slot {state.slot}"
+        )
+
+    # NOTE: ``while`` is guaranteed to terminate if we do not raise the previous ValidationError
+    while state.slot < slot:
+        state = _process_slot(state, config)
+
+        if (state.slot + 1) % config.SLOTS_PER_EPOCH == 0:
+            state = process_epoch(state, config)
+
+        state = _increment_slot(state)
 
     return state

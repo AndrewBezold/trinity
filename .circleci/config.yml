@@ -28,6 +28,9 @@ common: &common
         name: install libsnappy-dev
         command: sudo apt install -y libsnappy-dev
     - run:
+        name: install cmake
+        command: sudo apt install -y gcc g++ cmake
+    - run:
         name: install dependencies
         command: pip install --user tox
     - run:
@@ -40,6 +43,7 @@ common: &common
           - ~/.cache/pip
           - ~/.local
           - ./eggs
+          - .pytest_cache/v/eth2/bls/key-cache
         key: cache-v1-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}
 
 geth_steps: &geth_steps
@@ -48,32 +52,19 @@ geth_steps: &geth_steps
     - checkout
     - restore_cache:
         keys:
-          - cache-v1-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}
+          - cache-v2-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}-{{ checksum "./.circleci/build_geth.sh" }}
     - run:
         name: install libsnappy-dev
         command: sudo apt install -y libsnappy-dev
+    - run:
+        name: install cmake
+        command: sudo apt install -y gcc g++ cmake
     - run:
         name: install dependencies
         command: pip install --user tox
     - run:
         name: build geth if missing
-        command: |
-          mkdir -p $HOME/.ethash
-          pip install --user py-geth>=1.10.1
-          export GOROOT=/usr/local/go
-          export GETH_BINARY="$HOME/.py-geth/geth-$GETH_VERSION/bin/geth"
-          if [ ! -e "$GETH_BINARY" ]; then
-            curl -O https://storage.googleapis.com/golang/go1.7.4.linux-amd64.tar.gz
-            tar xvf go1.7.4.linux-amd64.tar.gz
-            sudo chown -R root:root ./go
-            sudo mv go /usr/local
-            sudo ln -s /usr/local/go/bin/go /usr/local/bin/go
-            sudo apt-get update;
-            sudo apt-get install -y build-essential;
-            python -m geth.install $GETH_VERSION;
-          fi
-          sudo ln -s /home/circleci/.py-geth/geth-$GETH_VERSION/bin/geth /usr/local/bin/geth
-          geth version
+        command: ./.circleci/build_geth.sh
     - run:
         name: run tox
         command: ~/.local/bin/tox -r
@@ -85,8 +76,51 @@ geth_steps: &geth_steps
           - ./eggs
           - ~/.ethash
           - ~/.py-geth
-        key: cache-v1-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}
+        key: cache-v2-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}-{{ checksum "./.circleci/build_geth.sh" }}
 
+eth2_fixtures: &eth2_fixtures
+  working_directory: ~/repo
+  steps:
+    - checkout
+    - run:
+        name: merge pull request base
+        command: ./.circleci/merge_pr.sh
+    - run:
+        name: merge pull request base (2nd try)
+        command: ./.circleci/merge_pr.sh
+        when: on_fail
+    - run:
+        name: merge pull request base (3nd try)
+        command: ./.circleci/merge_pr.sh
+        when: on_fail
+    - restore_cache:
+        keys:
+          - cache-v3-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}-{{ checksum "./.circleci/get_eth2_fixtures.sh" }}
+    - run:
+        name: install libsnappy-dev
+        command: sudo apt install -y libsnappy-dev
+    - run:
+        name: install cmake
+        command: sudo apt install -y gcc g++ cmake
+    - run:
+        name: download the required yaml files if missing
+        command: ./.circleci/get_eth2_fixtures.sh
+    - run:
+        name: install dependencies
+        command: pip install --user tox
+    - run:
+        name: run tox
+        command: ~/.local/bin/tox
+    - save_cache:
+        paths:
+          - .hypothesis
+          - .tox
+          - ~/.cache/pip
+          - ~/.local
+          - ./eggs
+          - .pytest_cache/v/eth2/bls/key-cache
+          - ./eth2-fixtures
+        key: cache-v3-{{ arch }}-{{ .Environment.CIRCLE_JOB }}-{{ checksum "setup.py" }}-{{ checksum "tox.ini" }}-{{ checksum "./.circleci/get_eth2_fixtures.sh" }}
 jobs:
   py36-lint:
     <<: *common
@@ -94,14 +128,24 @@ jobs:
       - image: circleci/python:3.6
         environment:
           TOXENV: py36-lint
-
   py37-lint:
     <<: *common
     docker:
       - image: circleci/python:3.7
         environment:
           TOXENV: py37-lint
-
+  py36-lint-eth2:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-lint-eth2
+  py37-lint-eth2:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-lint-eth2
 
   py36-docs:
     <<: *common
@@ -134,6 +178,13 @@ jobs:
       - image: circleci/python:3.6
         environment:
           TOXENV: py36-rpc-state-homestead
+  py36-rpc-state-petersburg:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-rpc-state-petersburg
+
   py36-rpc-state-tangerine_whistle:
     <<: *common
     docker:
@@ -153,12 +204,12 @@ jobs:
         environment:
           TOXENV: py36-rpc-blockchain
 
-  py36-core:
+  py36-eth1-core:
     <<: *common
     docker:
       - image: circleci/python:3.6
         environment:
-          TOXENV: py36-core
+          TOXENV: py36-eth1-core
   py36-integration:
     <<: *common
     docker:
@@ -171,7 +222,7 @@ jobs:
       - image: circleci/python:3.6
         environment:
           TOXENV: py36-lightchain_integration
-          GETH_VERSION: v1.8.1
+          GETH_VERSION: v1.8.22
   py36-long_run_integration:
     <<: *common
     docker:
@@ -184,31 +235,80 @@ jobs:
       - image: circleci/python:3.6
         environment:
           TOXENV: py36-p2p
-  py36-rpc-state-quadratic:
+  py36-p2p-trio:
     <<: *common
     docker:
       - image: circleci/python:3.6
         environment:
-          TOXENV: py36-rpc-state-quadratic
-  py36-eth2:
+          TOXENV: py36-p2p-trio
+  py36-eth2-core:
     <<: *common
     docker:
       - image: circleci/python:3.6
         environment:
-          TOXENV: py36-eth2
+          TOXENV: py36-eth2-core
+  py36-eth2-utils:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-eth2-utils
+  py36-eth2-fixtures:
+    <<: *eth2_fixtures
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-eth2-fixtures
+  py36-eth2-integration:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-eth2-integration
   py36-wheel-cli:
     <<: *common
     docker:
       - image: circleci/python:3.6
         environment:
           TOXENV: py36-wheel-cli
+  py36-eth1-plugins:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-eth1-plugins
+  py36-eth2-plugins:
+    <<: *common
+    docker:
+      - image: circleci/python:3.6
+        environment:
+          TOXENV: py36-eth2-plugins
 
-  py37-core:
+  py37-rpc-state-quadratic:
     <<: *common
     docker:
       - image: circleci/python:3.7
         environment:
-          TOXENV: py37-core
+          TOXENV: py37-rpc-state-quadratic
+  py37-rpc-state-sstore:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-rpc-state-sstore
+  py37-rpc-state-zero_knowledge:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-rpc-state-zero_knowledge
+
+  py37-eth1-core:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth1-core
   py37-integration:
     <<: *common
     docker:
@@ -221,18 +321,67 @@ jobs:
       - image: circleci/python:3.7
         environment:
           TOXENV: py37-p2p
-  py37-eth2:
+  py37-p2p-trio:
     <<: *common
     docker:
       - image: circleci/python:3.7
         environment:
-          TOXENV: py37-eth2
+          TOXENV: py37-p2p-trio
+  py37-eth2-core:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth2-core
+  py37-eth2-utils:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth2-utils
+  py37-eth2-fixtures:
+    <<: *eth2_fixtures
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth2-fixtures
+  py37-eth2-integration:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth2-integration
+  py37-libp2p:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-libp2p
   py37-wheel-cli:
     <<: *common
     docker:
       - image: circleci/python:3.7
         environment:
           TOXENV: py37-wheel-cli
+  py37-eth1-plugins:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth1-plugins
+  py37-eth2-plugins:
+    <<: *common
+    docker:
+      - image: circleci/python:3.7
+        environment:
+          TOXENV: py37-eth2-plugins
+
+  docker-image-build-test:
+    machine: true
+    steps:
+      - checkout
+      - run: docker build -t ethereum/trinity:test-build .
+      - run: docker run ethereum/trinity:test-build --help
 
 workflows:
   version: 2
@@ -240,28 +389,49 @@ workflows:
     jobs:
       - py36-docs
 
-      - py37-core
+      - py37-eth1-core
       - py37-wheel-cli
       - py37-p2p
-      - py37-eth2
+      - py36-p2p-trio
+      - py37-eth2-core
+      - py37-eth2-utils
+      - py37-eth2-fixtures
+      - py37-eth2-integration
+      - py37-eth2-plugins
+      - py37-libp2p
+      - py37-eth1-plugins
+
+      - py37-rpc-state-quadratic
+      - py37-rpc-state-sstore
+      - py37-rpc-state-zero_knowledge
 
       - py36-rpc-state-byzantium
       - py36-rpc-state-constantinople
       - py36-rpc-state-frontier
       - py36-rpc-state-homestead
-      - py36-rpc-state-tangerine_whistle
+      - py36-rpc-state-petersburg
       - py36-rpc-state-spurious_dragon
-      - py36-rpc-state-quadratic
+      - py36-rpc-state-tangerine_whistle
       - py36-rpc-blockchain
 
-      - py36-core
+      - py36-eth1-core
       - py36-wheel-cli
       - py36-p2p
-      - py36-eth2
+      - py36-p2p-trio
+      - py36-eth2-core
+      - py36-eth2-utils
+      - py36-eth2-fixtures
+      - py36-eth2-integration
+      - py36-eth2-plugins
+      - py36-eth1-plugins
 
       - py36-integration
       - py36-lightchain_integration
       - py36-long_run_integration
 
       - py36-lint
+      - py36-lint-eth2
       - py37-lint
+      - py37-lint-eth2
+
+      - docker-image-build-test

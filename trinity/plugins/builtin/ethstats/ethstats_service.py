@@ -2,47 +2,52 @@ import platform
 
 import websockets
 
-from eth.chains.base import (
-    BaseChain,
-)
-from p2p.events import (
-    PeerCountRequest,
-)
+from lahja import EndpointAPI
+
+from eth.abc import ChainAPI
+
 from p2p.service import (
     BaseService,
 )
+
 from trinity import (
     __version__,
 )
-from trinity.extensibility import (
-    PluginContext,
+from trinity.config import (
+    Eth1AppConfig,
 )
 from trinity.constants import (
     SYNC_LIGHT,
     TO_NETWORKING_BROADCAST_CONFIG,
 )
-from trinity.db.eth1.manager import (
-    create_db_consumer_manager,
-)
-from trinity.plugins.builtin.light_peer_chain_bridge.light_peer_chain_bridge import (
+from trinity.chains.light_eventbus import (
     EventBusLightPeerChain,
 )
+from trinity.db.eth1.header import AsyncHeaderDB
+from trinity.db.manager import DBClient
 from trinity._utils.version import (
     construct_trinity_client_identifier,
 )
 
+from trinity.extensibility.plugin import (
+    TrinityBootInfo,
+)
 from trinity.plugins.builtin.ethstats.ethstats_client import (
     EthstatsClient,
     EthstatsMessage,
     EthstatsData,
     timestamp_ms,
 )
+from trinity.protocol.common.events import (
+    PeerCountRequest,
+)
 
 
 class EthstatsService(BaseService):
     def __init__(
         self,
-        context: PluginContext,
+        boot_info: TrinityBootInfo,
+        event_bus: EndpointAPI,
         server_url: str,
         server_secret: str,
         node_id: str,
@@ -51,7 +56,8 @@ class EthstatsService(BaseService):
     ) -> None:
         super().__init__()
 
-        self.context = context
+        self.boot_info = boot_info
+        self.event_bus = event_bus
 
         self.server_url = server_url
         self.server_secret = server_secret
@@ -64,7 +70,7 @@ class EthstatsService(BaseService):
     async def _run(self) -> None:
         while self.is_operational:
             try:
-                self.logger.info('Connecting to %s...' % self.server_url)
+                self.logger.info('Connecting to %s...', self.server_url)
                 async with websockets.connect(self.server_url) as websocket:
                     client: EthstatsClient = EthstatsClient(
                         websocket,
@@ -79,7 +85,7 @@ class EthstatsService(BaseService):
                         self.statistics_handler(client),
                     )
             except websockets.ConnectionClosed as e:
-                self.logger.info('Connection to %s is closed: %s' % (self.server_url, e))
+                self.logger.info('Connection to %s is closed: %s', self.server_url, e)
 
             self.logger.info('Reconnecting in 5s...')
             await self.sleep(5)
@@ -114,8 +120,8 @@ class EthstatsService(BaseService):
             'name': self.node_id,
             'contact': self.node_contact,
             'node': construct_trinity_client_identifier(),
-            'net': self.context.trinity_config.network_id,
-            'port': self.context.trinity_config.port,
+            'net': self.boot_info.trinity_config.network_id,
+            'port': self.boot_info.trinity_config.port,
             'os': platform.system(),
             'os_v': platform.release(),
             'client': __version__,
@@ -139,7 +145,7 @@ class EthstatsService(BaseService):
         """Getter for data that should be sent periodically."""
         try:
             peer_count = (await self.wait(
-                self.context.event_bus.request(
+                self.event_bus.request(
                     PeerCountRequest(),
                     TO_NETWORKING_BROADCAST_CONFIG,
                 ),
@@ -155,21 +161,20 @@ class EthstatsService(BaseService):
             'peers': peer_count,
         }
 
-    def get_chain(self) -> BaseChain:
-        db_manager = create_db_consumer_manager(self.context.trinity_config.database_ipc_path)
+    def get_chain(self) -> ChainAPI:
+        app_config = self.boot_info.trinity_config.get_app_config(Eth1AppConfig)
+        chain_config = app_config.get_chain_config()
 
-        chain_config = self.context.trinity_config.get_chain_config()
+        chain: ChainAPI
+        base_db = DBClient.connect(self.boot_info.trinity_config.database_ipc_path)
 
-        chain: BaseChain
-
-        if self.context.args.sync_mode == SYNC_LIGHT:
-            header_db = db_manager.get_headerdb()  # type: ignore
+        if self.boot_info.args.sync_mode == SYNC_LIGHT:
+            header_db = AsyncHeaderDB(base_db)
             chain = chain_config.light_chain_class(
                 header_db,
-                peer_chain=EventBusLightPeerChain(self.context.event_bus)
+                peer_chain=EventBusLightPeerChain(self.event_bus)
             )
         else:
-            db = db_manager.get_db()  # type: ignore
-            chain = chain_config.full_chain_class(db)
+            chain = chain_config.full_chain_class(base_db)
 
         return chain

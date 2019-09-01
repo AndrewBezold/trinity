@@ -2,23 +2,12 @@ Plugin
 ======
 
 
-PluginContext
--------------
-
-.. autoclass:: trinity.extensibility.plugin.PluginContext
-  :members:
-
 BasePlugin
 ----------
 
 .. autoclass:: trinity.extensibility.plugin.BasePlugin
   :members:
 
-BaseAsyncStopPlugin
--------------------
-
-.. autoclass:: trinity.extensibility.plugin.BaseAsyncStopPlugin
-  :members:
 
 BaseMainProcessPlugin
 ---------------------
@@ -26,8 +15,8 @@ BaseMainProcessPlugin
 .. autoclass:: trinity.extensibility.plugin.BaseMainProcessPlugin
   :members:
 
-BaseIsolatedPlugin
-------------------
+AsyncioIsolatedPlugin
+---------------------
 
-.. autoclass:: trinity.extensibility.plugin.BaseIsolatedPlugin
+.. autoclass:: trinity.extensibility.asyncio.AsyncioIsolatedPlugin
   :members:

@@ -7,12 +7,15 @@ from typing import (
     Type,
 )
 
+from lahja import EndpointAPI
+
 from eth_typing import (
     BlockNumber,
 )
 from eth.constants import (
     GENESIS_BLOCK_NUMBER
 )
+from eth.db.header import HeaderDB
 from p2p.constants import (
     DISCOVERY_EVENTBUS_ENDPOINT,
 )
@@ -21,8 +24,8 @@ from p2p.discovery import (
     DiscoveryByTopicProtocol,
     DiscoveryProtocol,
     DiscoveryService,
-    NoopDiscoveryService,
     PreferredNodeDiscoveryProtocol,
+    StaticDiscoveryService,
 )
 from p2p.kademlia import (
     Address,
@@ -40,14 +43,10 @@ from trinity.config import (
     Eth1DbMode,
     TrinityConfig,
 )
-from trinity.db.eth1.manager import (
-    create_db_consumer_manager
-)
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
+from trinity.db.manager import DBClient
+from trinity.events import ShutdownRequest
 from trinity.extensibility import (
-    BaseIsolatedPlugin,
+    AsyncioIsolatedPlugin,
 )
 from trinity.protocol.bcc.proto import (
     BCCProtocol,
@@ -59,7 +58,7 @@ from trinity.protocol.les.proto import (
     LESProtocolV2,
 )
 from trinity._utils.shutdown import (
-    exit_with_service_and_endpoint,
+    exit_with_services,
 )
 
 
@@ -80,9 +79,9 @@ def get_protocol(trinity_config: TrinityConfig) -> Type[Protocol]:
 
 
 def get_discv5_topic(trinity_config: TrinityConfig, protocol: Type[Protocol]) -> bytes:
-    db_manager = create_db_consumer_manager(trinity_config.database_ipc_path)
+    db = DBClient.connect(trinity_config.database_ipc_path)
 
-    header_db = db_manager.get_headerdb()  # type: ignore
+    header_db = HeaderDB(db)
     genesis_hash = header_db.get_canonical_block_hash(BlockNumber(GENESIS_BLOCK_NUMBER))
 
     return get_v5_topic(protocol, genesis_hash)
@@ -95,7 +94,7 @@ class DiscoveryBootstrapService(BaseService):
 
     def __init__(self,
                  disable_discovery: bool,
-                 event_bus: TrinityEventBusEndpoint,
+                 event_bus: EndpointAPI,
                  trinity_config: TrinityConfig) -> None:
         super().__init__()
         self.is_discovery_disabled = disable_discovery
@@ -127,8 +126,9 @@ class DiscoveryBootstrapService(BaseService):
             )
 
         if self.is_discovery_disabled:
-            discovery_service: BaseService = NoopDiscoveryService(
+            discovery_service: BaseService = StaticDiscoveryService(
                 self.event_bus,
+                self.trinity_config.preferred_nodes,
                 self.cancel_token,
             )
         else:
@@ -139,10 +139,13 @@ class DiscoveryBootstrapService(BaseService):
                 self.cancel_token,
             )
 
-        await discovery_service.run()
+        try:
+            await discovery_service.run()
+        except Exception:
+            await self.event_bus.broadcast(ShutdownRequest("Discovery ended unexpectedly"))
 
 
-class PeerDiscoveryPlugin(BaseIsolatedPlugin):
+class PeerDiscoveryPlugin(AsyncioIsolatedPlugin):
     """
     Continously discover other Ethereum nodes.
     """
@@ -155,10 +158,13 @@ class PeerDiscoveryPlugin(BaseIsolatedPlugin):
     def normalized_name(self) -> str:
         return DISCOVERY_EVENTBUS_ENDPOINT
 
-    def on_ready(self, manager_eventbus: TrinityEventBusEndpoint) -> None:
+    def on_ready(self, manager_eventbus: EndpointAPI) -> None:
         self.start()
 
-    def configure_parser(self, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
+    @classmethod
+    def configure_parser(cls,
+                         arg_parser: ArgumentParser,
+                         subparser: _SubParsersAction) -> None:
         arg_parser.add_argument(
             "--disable-discovery",
             action="store_true",
@@ -166,13 +172,13 @@ class PeerDiscoveryPlugin(BaseIsolatedPlugin):
         )
 
     def do_start(self) -> None:
-        loop = asyncio.get_event_loop()
         discovery_bootstrap = DiscoveryBootstrapService(
-            self.context.args.disable_discovery,
+            self.boot_info.args.disable_discovery,
             self.event_bus,
-            self.context.trinity_config
+            self.boot_info.trinity_config
         )
-        asyncio.ensure_future(exit_with_service_and_endpoint(discovery_bootstrap, self.event_bus))
+        asyncio.ensure_future(exit_with_services(
+            discovery_bootstrap,
+            self._event_bus_service,
+        ))
         asyncio.ensure_future(discovery_bootstrap.run())
-        loop.run_forever()
-        loop.close()

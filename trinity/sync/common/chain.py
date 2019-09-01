@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from typing import (
     AsyncIterator,
     Tuple,
@@ -20,25 +21,36 @@ from eth_utils import (
     encode_hex,
     ValidationError,
 )
-from eth.rlp.headers import (
-    BlockHeader,
+
+from eth.abc import (
+    BlockAPI,
+    BlockHeaderAPI,
+    SignedTransactionAPI,
 )
+
+from eth2.beacon.types.blocks import BaseBeaconBlock
 
 from p2p.constants import (
     MAX_REORG_DEPTH,
     SEAL_CHECK_RANDOM_SAMPLE_RATE,
 )
-from p2p.p2p_proto import (
-    DisconnectReason,
-)
-from p2p.service import (
-    BaseService,
-)
+from p2p.disconnect import DisconnectReason
+from p2p.service import BaseService
 
-from trinity.chains.base import BaseAsyncChain
+from trinity._utils.headers import (
+    skip_complete_headers,
+)
+from trinity._utils.humanize import (
+    humanize_integer_sequence,
+)
+from trinity.chains.base import AsyncChainAPI
 from trinity.db.eth1.header import BaseAsyncHeaderDB
 from trinity.protocol.common.peer import (
     BaseChainPeer,
+)
+
+from eth2.beacon.chains.base import (
+    BaseBeaconChain
 )
 
 from .types import SyncProgress
@@ -54,7 +66,7 @@ class PeerHeaderSyncer(BaseService):
     _seal_check_random_sample_rate = SEAL_CHECK_RANDOM_SAMPLE_RATE
 
     def __init__(self,
-                 chain: BaseAsyncChain,
+                 chain: AsyncChainAPI,
                  db: BaseAsyncHeaderDB,
                  peer: BaseChainPeer,
                  token: CancelToken = None) -> None:
@@ -74,7 +86,7 @@ class PeerHeaderSyncer(BaseService):
     async def _run(self) -> None:
         await self.events.cancelled.wait()
 
-    async def next_header_batch(self) -> AsyncIterator[Tuple[BlockHeader, ...]]:
+    async def next_header_batch(self) -> AsyncIterator[Tuple[BlockHeaderAPI, ...]]:
         """Try to fetch headers until the given peer's head_hash.
 
         Returns when the peer's head_hash is available in our ChainDB, or if any error occurs
@@ -95,11 +107,11 @@ class PeerHeaderSyncer(BaseService):
                 peer, peer.head_td, head_td)
         self.sync_progress = SyncProgress(head.block_number, head.block_number, peer.head_number)
         self.logger.info("Starting sync with %s", peer)
-        last_received_header: BlockHeader = None
+        last_received_header: BlockHeaderAPI = None
         # When we start the sync with a peer, we always request up to MAX_REORG_DEPTH extra
         # headers before our current head's number, in case there were chain reorgs since the last
         # time _sync() was called. All of the extra headers that are already present in our DB
-        # will be discarded by _fetch_missing_headers() so we don't unnecessarily process them
+        # will be discarded by skip_complete_headers() so we don't unnecessarily process them
         # again.
         start_at = max(GENESIS_BLOCK_NUMBER + 1, head.block_number - MAX_REORG_DEPTH)
         while self.is_operational:
@@ -111,12 +123,10 @@ class PeerHeaderSyncer(BaseService):
                 all_headers = await self.wait(self._request_headers(peer, start_at))
                 if last_received_header is None:
                     # Skip over existing headers on the first run-through
-                    headers = tuple(
-                        # The inner list comprehension is needed because async_generators
-                        # cannot be cast to a tuple.
-                        [header async for header in self._get_missing_tail(all_headers)]
+                    completed_headers, new_headers = await self.wait(
+                        skip_complete_headers(all_headers, self.db.coro_header_exists)
                     )
-                    if len(headers) == 0 and len(all_headers) > 0:
+                    if len(new_headers) == 0 and len(completed_headers) > 0:
                         head = await self.wait(self.db.coro_get_canonical_head())
                         start_at = max(
                             all_headers[-1].block_number + 1,
@@ -124,14 +134,22 @@ class PeerHeaderSyncer(BaseService):
                         )
                         self.logger.debug(
                             "All %d headers redundant, head at %s, fetching from #%d",
-                            len(all_headers),
+                            len(completed_headers),
                             head,
                             start_at,
                         )
                         continue
+                    elif completed_headers:
+                        self.logger.debug(
+                            "Header sync skipping over (%d) already stored headers %s: %s..%s",
+                            len(completed_headers),
+                            humanize_integer_sequence(h.block_number for h in completed_headers),
+                            completed_headers[0],
+                            completed_headers[-1],
+                        )
                 else:
-                    headers = all_headers
-                self.logger.debug2('sync received new headers: %s', headers)
+                    new_headers = all_headers
+                self.logger.debug2('sync received new headers: %s', new_headers)
             except OperationCancelled:
                 self.logger.info("Sync with %s completed", peer)
                 break
@@ -147,7 +165,7 @@ class PeerHeaderSyncer(BaseService):
                 await peer.disconnect(DisconnectReason.useless_peer)
                 break
 
-            if not headers:
+            if not new_headers:
                 if last_received_header is None:
                     request_parent = head
                 else:
@@ -167,7 +185,7 @@ class PeerHeaderSyncer(BaseService):
                     self.logger.info("Got no new headers from %s, aborting sync", peer)
                 break
 
-            first = headers[0]
+            first = new_headers[0]
             first_parent = None
             if last_received_header is None:
                 # on the first request, make sure that the earliest ancestor has a parent in our db
@@ -195,12 +213,12 @@ class PeerHeaderSyncer(BaseService):
                 "Got new header chain from %s: %s..%s",
                 peer,
                 first,
-                headers[-1],
+                new_headers[-1],
             )
             try:
                 await self.chain.coro_validate_chain(
                     last_received_header or first_parent,
-                    headers,
+                    new_headers,
                     self._seal_check_random_sample_rate,
                 )
             except ValidationError as e:
@@ -208,21 +226,21 @@ class PeerHeaderSyncer(BaseService):
                 await peer.disconnect(DisconnectReason.subprotocol_error)
                 break
 
-            for header in headers:
+            for header in new_headers:
                 head_td += header.difficulty
 
             # Setting the latest header hash for the peer, before queuing header processing tasks
             self._target_header_hash = peer.head_hash
 
-            yield headers
-            last_received_header = headers[-1]
+            yield new_headers
+            last_received_header = new_headers[-1]
             self.sync_progress = self.sync_progress.update_current_block(
                 last_received_header.block_number,
             )
             start_at = last_received_header.block_number + 1
 
     async def _request_headers(
-            self, peer: BaseChainPeer, start_at: BlockNumber) -> Tuple[BlockHeader, ...]:
+            self, peer: BaseChainPeer, start_at: BlockNumber) -> Tuple[BlockHeaderAPI, ...]:
         """Fetch a batch of headers starting at start_at and return the ones we're missing."""
         self.logger.debug("Requsting chain of headers from %s starting at #%d", peer, start_at)
 
@@ -233,22 +251,61 @@ class PeerHeaderSyncer(BaseService):
             reverse=False,
         )
 
-    async def _get_missing_tail(
-            self,
-            headers: Tuple[BlockHeader, ...]) -> AsyncIterator[BlockHeader]:
-        """
-        We only want headers that are missing, so we iterate over the list
-        until we find the first missing header, after which we return all of
-        the remaining headers.
-        """
-        iter_headers = iter(headers)
-        for header in iter_headers:
-            is_present = await self.wait(self.db.coro_header_exists(header.hash))
-            if is_present:
-                self.logger.debug("Discarding header that we already have: %s", header)
-            else:
-                yield header
-                break
 
-        for header in iter_headers:
-            yield header
+class BaseBlockImporter(ABC):
+    @abstractmethod
+    async def import_block(
+            self,
+            block: BlockAPI) -> Tuple[BlockAPI, Tuple[BlockAPI, ...], Tuple[BlockAPI, ...]]:
+        ...
+
+    async def preview_transactions(
+            self,
+            header: BlockHeaderAPI,
+            transactions: Tuple[SignedTransactionAPI, ...],
+            parent_state_root: Hash32,
+            lagging: bool = True) -> None:
+        """
+        Give the importer a chance to preview upcoming blocks. This can improve performance
+
+        :param header: The header of the upcoming block
+        :param transactions: The transactions in the upcoming block
+        :param parent_state_root: The state root hash at the beginning of the upcoming block
+            (the end of the previous block)
+        :param lagging: Is the upcoming block *very* far ahead of the current block?
+
+        The lagging parameter is used to take actions that may be resource-intensive and slow,
+        but will accelerate the block once we catch up to it. A slow preparation is a waste of
+        resources unless the upcoming block is far enough in the future.
+        """
+        # default action: none
+        pass
+
+
+class SimpleBlockImporter(BaseBlockImporter):
+    def __init__(self, chain: AsyncChainAPI) -> None:
+        self._chain = chain
+
+    async def import_block(
+            self,
+            block: BlockAPI) -> Tuple[BlockAPI, Tuple[BlockAPI, ...], Tuple[BlockAPI, ...]]:
+        return await self._chain.coro_import_block(block, perform_validation=True)
+
+
+class BaseSyncBlockImporter(ABC):
+    @abstractmethod
+    def import_block(
+            self,
+            block: BlockAPI) -> Tuple[BlockAPI, Tuple[BlockAPI, ...], Tuple[BlockAPI, ...]]:
+        ...
+
+
+class SyncBlockImporter(BaseSyncBlockImporter):
+    def __init__(self, chain: BaseBeaconChain) -> None:
+        self._chain = chain
+
+    def import_block(
+            self,
+            block: BaseBeaconBlock
+    ) -> Tuple[BaseBeaconBlock, Tuple[BaseBeaconBlock, ...], Tuple[BaseBeaconBlock, ...]]:
+        return self._chain.import_block(block, perform_validation=True)

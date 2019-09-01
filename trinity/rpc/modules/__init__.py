@@ -3,16 +3,13 @@ from typing import (
     Iterable,
 )
 
+from lahja import EndpointAPI
+
 from eth_utils import (
     to_tuple,
 )
 
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
-from trinity.chains.base import (
-    BaseAsyncChain
-)
+from trinity.chains.base import AsyncChainAPI
 
 from .main import (  # noqa: F401
     BaseRPCModule,
@@ -31,8 +28,8 @@ from .web3 import Web3  # noqa: F401
 
 
 @to_tuple
-def initialize_eth1_modules(chain: BaseAsyncChain,
-                            event_bus: TrinityEventBusEndpoint) -> Iterable[BaseRPCModule]:
+def initialize_eth1_modules(chain: AsyncChainAPI,
+                            event_bus: EndpointAPI) -> Iterable[BaseRPCModule]:
     yield Eth(chain, event_bus)
     yield EVM(chain, event_bus)
     yield Net(event_bus)
@@ -42,5 +39,5 @@ def initialize_eth1_modules(chain: BaseAsyncChain,
 
 @to_tuple
 def initialize_beacon_modules(chain: Any,
-                              event_bus: TrinityEventBusEndpoint) -> Iterable[BaseRPCModule]:
+                              event_bus: EndpointAPI) -> Iterable[BaseRPCModule]:
     yield Beacon(chain, event_bus)

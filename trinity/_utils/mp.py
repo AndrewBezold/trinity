@@ -1,12 +1,9 @@
-import asyncio
-import functools
 import inspect
 import multiprocessing
 import os
 import traceback
 from typing import (
     Any,
-    Awaitable,
     Callable,
     List,
 )
@@ -20,25 +17,6 @@ MP_CONTEXT = os.environ.get('TRINITY_MP_CONTEXT', 'spawn')
 
 # sets the type of process that multiprocessing will create.
 ctx = multiprocessing.get_context(MP_CONTEXT)
-
-
-def async_method(method_name: str) -> Callable[..., Any]:
-    async def method(self: Any, *args: Any, **kwargs: Any) -> Awaitable[Any]:
-        loop = asyncio.get_event_loop()
-
-        return await loop.run_in_executor(
-            None,
-            functools.partial(self._callmethod, kwds=kwargs),
-            method_name,
-            args,
-        )
-    return method
-
-
-def sync_method(method_name: str) -> Callable[..., Any]:
-    def method(self: Any, *args: Any, **kwargs: Any) -> Any:
-        return self._callmethod(method_name, args, kwargs)
-    return method
 
 
 class TracebackRecorder:
@@ -87,7 +65,11 @@ class RemoteTraceback(Exception):
 class ChainedExceptionWithTraceback(Exception):
 
     def __init__(self, exc: Exception, tb: TracebackType) -> None:
-        self.tb = '\n"""\n%s"""' % ''.join(traceback.format_exception(type(exc), exc, tb))
+        self.tb = (
+            '\n"""\n'
+            f"{''.join(traceback.format_exception(type(exc), exc, tb))}"
+            '"""'
+        )
         self.exc = exc
 
     def __reduce__(self) -> Any:

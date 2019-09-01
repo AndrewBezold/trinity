@@ -1,26 +1,18 @@
 import asyncio
 import pytest
 
-from trinity.protocol.les.peer import (
-    LESPeer,
-)
 from trinity.protocol.les.proto import (
     LESProtocol,
+    LESProtocolV2,
 )
 
-from tests.core.peer_helpers import (
-    get_directly_linked_peers,
-)
+from trinity.tools.factories import LESV2PeerPairFactory
 
 
 @pytest.fixture
 async def les_peer_and_remote(request, event_loop):
-    peer, remote = await get_directly_linked_peers(
-        request,
-        event_loop,
-        alice_peer_class=LESPeer,
-    )
-    return peer, remote
+    async with LESV2PeerPairFactory() as (alice, bob):
+        yield alice, bob
 
 
 @pytest.mark.parametrize(
@@ -43,16 +35,24 @@ async def test_les_protocol_methods_request_id(
     assert isinstance(peer.sub_proto, LESProtocol)
     assert isinstance(remote.sub_proto, LESProtocol)
 
-    # Test for get_block_headers
-    with remote.collect_sub_proto_messages() as buffer:
-        generated_request_id = peer.sub_proto.send_get_block_headers(
-            b'1234', 1, 0, False, request_id=request_id
-        )
-        await asyncio.sleep(0.1)
+    # setup message collection
+    messages = []
+    got_message = asyncio.Event()
 
-    messages = buffer.get_messages()
+    async def collect_messages(conn, cmd, msg):
+        messages.append((cmd, msg))
+        got_message.set()
+
+    peer.connection.add_protocol_handler(LESProtocolV2, collect_messages)
+
+    # Test for get_block_headers
+    generated_request_id = remote.sub_proto.send_get_block_headers(
+        b'1234', 1, 0, False, request_id=request_id
+    )
+    await asyncio.wait_for(got_message.wait(), timeout=1)
+
     assert len(messages) == 1
-    peer, cmd, msg = messages[0]
+    cmd, msg = messages[0]
 
     # Asserted that the reply message has the request_id as that which was generated
     assert generated_request_id == msg['request_id']

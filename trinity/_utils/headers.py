@@ -1,16 +1,15 @@
 from typing import (
+    Awaitable,
+    Callable,
     cast,
     Iterable,
-    AsyncIterator,
     Tuple,
     TypeVar,
 )
 
 from eth.constants import UINT_256_MAX
 from eth.rlp.headers import BlockHeader
-from p2p.service import BaseService
 
-from trinity.db.eth1.header import BaseAsyncHeaderDB
 from trinity.exceptions import OversizeObject
 
 
@@ -45,35 +44,25 @@ def sequence_builder(start_number: T,
     )
 
 
-async def skip_headers_in_db(
-        headers: Iterable[BlockHeader],
-        db: BaseAsyncHeaderDB,
-        service: BaseService) -> Tuple[BlockHeader, ...]:
-    skip_headers_coro = _skip_db_headers_iterator(headers, db, service)
-    return tuple(
-        # The inner list comprehension is needed because async_generators
-        # cannot be cast to a tuple.
-        [header async for header in service.wait_iter(skip_headers_coro)]
-    )
-
-
-async def _skip_db_headers_iterator(
-        headers: Iterable[BlockHeader],
-        db: BaseAsyncHeaderDB,
-        service: BaseService) -> AsyncIterator[BlockHeader]:
+async def skip_complete_headers(
+        headers_iter: Iterable[BlockHeader],
+        completion_check: Callable[[BlockHeader], Awaitable[bool]]) -> Tuple[BlockHeader, ...]:
     """
-    We only want headers that are missing, so we iterate over the list
-    until we find the first missing header, after which we return all of
-    the remaining headers.
+    Collect all completed headers into a tuple, and the remaining headers into a second tuple,
+    using `completion_check(header)` to decide on completion.
+
+    Note that `completion_check` is *not* run on the remaining headers after the first time
+    that it returns ``False``.
+
+    Services should call self.wait() when using this method.
     """
-    iter_headers = iter(headers)
-    for header in iter_headers:
-        is_present = await service.wait(db.coro_header_exists(header.hash))
-        if is_present:
-            service.logger.debug("Discarding header that we already have: %s", header)
-        else:
-            yield header
+    headers = tuple(headers_iter)
+    for index, header in enumerate(headers):
+        if not await completion_check(header):
+            # index of first header that is not complete
+            first_incomplete_index = index
             break
+    else:
+        first_incomplete_index = len(headers)
 
-    for header in iter_headers:
-        yield header
+    return tuple(headers[:first_incomplete_index]), tuple(headers[first_incomplete_index:])

@@ -7,18 +7,18 @@ from argparse import (
     _SubParsersAction,
 )
 
+from lahja.base import EndpointAPI
+
 from trinity.constants import (
     MAINNET_NETWORK_ID,
     ROPSTEN_NETWORK_ID,
 )
-from trinity.endpoint import (
-    TrinityEventBusEndpoint,
-)
+from trinity.events import ShutdownRequest
 from trinity.extensibility import (
-    BaseIsolatedPlugin,
+    AsyncioIsolatedPlugin,
 )
 from trinity._utils.shutdown import (
-    exit_with_service_and_endpoint,
+    exit_with_services,
 )
 
 from trinity.plugins.builtin.ethstats.ethstats_service import (
@@ -31,7 +31,7 @@ DEFAULT_SERVERS_URLS = {
 }
 
 
-class EthstatsPlugin(BaseIsolatedPlugin):
+class EthstatsPlugin(AsyncioIsolatedPlugin):
     server_url: str
     server_secret: str
     stats_interval: int
@@ -43,9 +43,10 @@ class EthstatsPlugin(BaseIsolatedPlugin):
         return 'Ethstats'
 
     def get_default_server_url(self) -> str:
-        return DEFAULT_SERVERS_URLS.get(self.context.trinity_config.network_id, '')
+        return DEFAULT_SERVERS_URLS.get(self.boot_info.trinity_config.network_id, '')
 
-    def configure_parser(self, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
+    @classmethod
+    def configure_parser(cls, arg_parser: ArgumentParser, subparser: _SubParsersAction) -> None:
         ethstats_parser = arg_parser.add_argument_group('ethstats (experimental)')
 
         ethstats_parser.add_argument(
@@ -80,8 +81,8 @@ class EthstatsPlugin(BaseIsolatedPlugin):
             default=10,
         )
 
-    def on_ready(self, manager_eventbus: TrinityEventBusEndpoint) -> None:
-        args = self.context.args
+    def on_ready(self, manager_eventbus: EndpointAPI) -> None:
+        args = self.boot_info.args
 
         if not args.ethstats:
             return
@@ -90,14 +91,14 @@ class EthstatsPlugin(BaseIsolatedPlugin):
             self.logger.error(
                 'You must provide ethstats server url using the `--ethstats-server-url`'
             )
-            manager_eventbus.request_shutdown("Missing EthStats Server URL")
+            manager_eventbus.broadcast_nowait(ShutdownRequest("Missing EthStats Server URL"))
             return
 
         if not args.ethstats_server_secret:
             self.logger.error(
                 'You must provide ethstats server secret using `--ethstats-server-secret`'
             )
-            manager_eventbus.request_shutdown("Missing EthStats Server Secret")
+            manager_eventbus.broadcast_nowait(ShutdownRequest("Missing EthStats Server Secret"))
             return
 
         if (args.ethstats_server_url):
@@ -115,7 +116,8 @@ class EthstatsPlugin(BaseIsolatedPlugin):
 
     def do_start(self) -> None:
         service = EthstatsService(
-            self.context,
+            self.boot_info,
+            self.event_bus,
             self.server_url,
             self.server_secret,
             self.node_id,
@@ -123,10 +125,8 @@ class EthstatsPlugin(BaseIsolatedPlugin):
             self.stats_interval,
         )
 
-        loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
-
-        asyncio.ensure_future(exit_with_service_and_endpoint(service, self.context.event_bus))
+        asyncio.ensure_future(exit_with_services(
+            service,
+            self._event_bus_service,
+        ))
         asyncio.ensure_future(service.run())
-
-        loop.run_forever()
-        loop.close()

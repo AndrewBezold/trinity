@@ -12,6 +12,8 @@ This section aims to provide a detailed description of all APIs. If you are look
    :name: toc-api-trinity
 
    api.cli
+   api.config
    extensibility/index
+   protocol/index
 
 

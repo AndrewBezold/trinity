@@ -1,62 +1,33 @@
-from abc import ABC
 import logging
 import struct
 from typing import (
-    Any,
-    Dict,
-    Generic,
-    List,
+    ClassVar,
+    Sequence,
     Tuple,
     Type,
-    TypeVar,
-    TYPE_CHECKING,
     Union,
 )
 
-from mypy_extensions import (
-    TypedDict,
-)
-
 import snappy
+
+from eth_utils.toolz import accumulate
 
 import rlp
 from rlp import sedes
 
 from eth.constants import NULL_BYTE
 
-from p2p.exceptions import (
-    MalformedMessage,
-)
 from p2p._utils import get_devp2p_cmd_id
-
-# Workaround for import cycles caused by type annotations:
-# http://mypy.readthedocs.io/en/latest/common_issues.html#import-cycles
-if TYPE_CHECKING:
-    from p2p.peer import BasePeer  # noqa: F401
-
-
-class TypedDictPayload(TypedDict):
-    pass
+from p2p.abc import CommandAPI, ProtocolAPI, RequestAPI, TransportAPI
+from p2p.constants import P2P_PROTOCOL_COMMAND_LENGTH
+from p2p.exceptions import MalformedMessage
+from p2p.typing import Capability, Payload, Structure
 
 
-PayloadType = Union[
-    Dict[str, Any],
-    List[rlp.Serializable],
-    Tuple[rlp.Serializable, ...],
-    TypedDictPayload,
-]
-
-# A payload to be delivered with a request
-TRequestPayload = TypeVar('TRequestPayload', bound=PayloadType, covariant=True)
-
-# for backwards compatibility for internal references in p2p:
-_DecodedMsgType = PayloadType
-
-
-class Command:
+class Command(CommandAPI):
     _cmd_id: int = None
     decode_strict = True
-    structure: List[Tuple[str, Any]] = []
+    structure: Structure
 
     _logger: logging.Logger = None
 
@@ -78,24 +49,28 @@ class Command:
     def __str__(self) -> str:
         return f"{type(self).__name__} (cmd_id={self.cmd_id})"
 
-    def encode_payload(self, data: Union[PayloadType, sedes.CountableList]) -> bytes:
-        if isinstance(data, dict):  # convert dict to ordered list
-            if not isinstance(self.structure, list):
-                raise ValueError("Command.structure must be a list when data is a dict")
+    def encode_payload(self, data: Union[Payload, sedes.CountableList]) -> bytes:
+        if isinstance(data, dict):
+            if not isinstance(self.structure, tuple):
+                raise ValueError(
+                    "Command.structure must be a list when data is a dict.  Got "
+                    f"{self.structure}"
+                )
             expected_keys = sorted(name for name, _ in self.structure)
             data_keys = sorted(data.keys())
             if data_keys != expected_keys:
                 raise ValueError(
                     f"Keys in data dict ({data_keys}) do not match expected keys ({expected_keys})"
                 )
-            data = [data[name] for name, _ in self.structure]
+            data = tuple(data[name] for name, _ in self.structure)
+
         if isinstance(self.structure, sedes.CountableList):
             encoder = self.structure
         else:
             encoder = sedes.List([type_ for _, type_ in self.structure])
         return rlp.encode(data, sedes=encoder)
 
-    def decode_payload(self, rlp_data: bytes) -> PayloadType:
+    def decode_payload(self, rlp_data: bytes) -> Payload:
         if isinstance(self.structure, sedes.CountableList):
             decoder = self.structure
         else:
@@ -114,7 +89,7 @@ class Command:
             in zip(self.structure, data)
         }
 
-    def decode(self, data: bytes) -> PayloadType:
+    def decode(self, data: bytes) -> Payload:
         packet_type = get_devp2p_cmd_id(data)
         if packet_type != self.cmd_id:
             raise MalformedMessage(f"Wrong packet type: {packet_type}, expected {self.cmd_id}")
@@ -127,7 +102,12 @@ class Command:
     def decompress_payload(self, raw_payload: bytes) -> bytes:
         # Do the Snappy Decompression only if Snappy Compression is supported by the protocol
         if self.snappy_support:
-            return snappy.decompress(raw_payload)
+            try:
+                return snappy.decompress(raw_payload)
+            except Exception as err:
+                # log this just in case it's a library error of some kind on valid messages.
+                self.logger.debug("Snappy decompression error on payload: %s", raw_payload.hex())
+                raise MalformedMessage from err
         else:
             return raw_payload
 
@@ -138,7 +118,7 @@ class Command:
         else:
             return raw_payload
 
-    def encode(self, data: PayloadType) -> Tuple[bytes, bytes]:
+    def encode(self, data: Payload) -> Tuple[bytes, bytes]:
         encoded_payload = self.encode_payload(data)
         compressed_payload = self.compress_payload(encoded_payload)
 
@@ -160,36 +140,24 @@ class Command:
         return header, body
 
 
-class BaseRequest(ABC, Generic[TRequestPayload]):
-    """
-    Must define command_payload during init. This is the data that will
-    be sent to the peer with the request command.
-    """
-    # Defined at init time, with specific parameters:
-    command_payload: TRequestPayload
-
-    # Defined as class attributes in subclasses
-    # outbound command type
-    cmd_type: Type[Command]
-    # response command type
-    response_type: Type[Command]
-
-
-class Protocol:
-    peer: 'BasePeer'
-    name: str = None
-    version: int = None
+class Protocol(ProtocolAPI):
+    transport: TransportAPI
+    name: ClassVar[str]
+    version: ClassVar[int]
     cmd_length: int = None
-    # List of Command classes that this protocol supports.
-    _commands: List[Type[Command]] = []
+    # Command classes that this protocol supports.
+    _commands: Tuple[Type[CommandAPI], ...]
 
     _logger: logging.Logger = None
 
-    def __init__(self, peer: 'BasePeer', cmd_id_offset: int, snappy_support: bool) -> None:
-        self.peer = peer
+    def __init__(self, transport: TransportAPI, cmd_id_offset: int, snappy_support: bool) -> None:
+        self.transport = transport
         self.cmd_id_offset = cmd_id_offset
         self.snappy_support = snappy_support
-        self.commands = [cmd_class(cmd_id_offset, snappy_support) for cmd_class in self._commands]
+        self.commands = tuple(
+            cmd_class(cmd_id_offset, snappy_support)
+            for cmd_class in self._commands
+        )
         self.cmd_by_type = {type(cmd): cmd for cmd in self.commands}
         self.cmd_by_id = {cmd.cmd_id: cmd for cmd in self.commands}
 
@@ -199,16 +167,18 @@ class Protocol:
             self._logger = logging.getLogger(f"p2p.protocol.{type(self).__name__}")
         return self._logger
 
-    def send(self, header: bytes, body: bytes) -> None:
-        self.peer.send(header, body)
-
-    def send_request(self, request: BaseRequest[PayloadType]) -> None:
+    def send_request(self, request: RequestAPI[Payload]) -> None:
         command = self.cmd_by_type[request.cmd_type]
         header, body = command.encode(request.command_payload)
-        self.send(header, body)
+        self.transport.send(header, body)
 
-    def supports_command(self, cmd_type: Type[Command]) -> bool:
-        return cmd_type in self.cmd_by_type
+    @classmethod
+    def supports_command(cls, cmd_type: Type[CommandAPI]) -> bool:
+        return cmd_type in cls._commands
+
+    @classmethod
+    def as_capability(cls) -> Capability:
+        return (cls.name, cls.version)
 
     def __repr__(self) -> str:
         return "(%s, %d)" % (self.name, self.version)
@@ -220,3 +190,17 @@ def _pad_to_16_byte_boundary(data: bytes) -> bytes:
     if remainder != 0:
         data += NULL_BYTE * (16 - remainder)
     return data
+
+
+def get_cmd_offsets(protocol_types: Sequence[Type[ProtocolAPI]]) -> Tuple[int, ...]:
+    """
+    Computes the `command_id_offsets` for each protocol.  The first offset is
+    always P2P_PROTOCOL_COMMAND_LENGTH since the first protocol always begins
+    after the base `p2p` protocol.  Each subsequent protocol is the accumulated
+    sum of all of the protocol offsets that came before it.
+    """
+    return tuple(accumulate(
+        lambda prev_offset, protocol_class: prev_offset + protocol_class.cmd_length,
+        protocol_types,
+        P2P_PROTOCOL_COMMAND_LENGTH,
+    ))[:-1]  # the `[:-1]` is to discard the last accumulated offset which is not needed

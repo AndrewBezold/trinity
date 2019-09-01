@@ -1,115 +1,39 @@
-from typing import (
-    Sequence,
-    Tuple,
-    TYPE_CHECKING,
-)
+from typing import TYPE_CHECKING, Callable, Sequence, Set, Tuple
 
+from eth_typing import Hash32
+from eth_utils import ValidationError
+from py_ecc.bls.typing import Domain
 
-from eth_utils import (
-    ValidationError,
-)
-from eth_typing import (
-    Hash32,
-)
-
-from eth2.beacon._utils.hash import (
-    hash_eth2,
-)
-from eth2.beacon.enums import (
-    SignatureDomain,
-)
+from eth2._utils.hash import hash_eth2
+from eth2.beacon.signature_domain import SignatureDomain
+from eth2.beacon.types.forks import Fork
+from eth2.beacon.types.validators import Validator
 from eth2.beacon.typing import (
+    DomainType,
     Epoch,
     Gwei,
     Slot,
     ValidatorIndex,
+    Version,
+    default_version,
 )
-from eth2.beacon.validation import (
-    validate_epoch_for_active_index_root,
-    validate_epoch_for_active_randao_mix,
-)
+from eth2.configs import CommitteeConfig
 
 if TYPE_CHECKING:
-    from eth2.beacon.types.attestation_data import AttestationData  # noqa: F401
     from eth2.beacon.types.states import BeaconState  # noqa: F401
-    from eth2.beacon.types.forks import Fork  # noqa: F401
-    from eth2.beacon.types.slashable_attestations import SlashableAttestation  # noqa: F401
-    from eth2.beacon.types.validator_records import ValidatorRecord  # noqa: F401
 
 
-#
-# Time unit convertion
-#
-def slot_to_epoch(slot: Slot, slots_per_epoch: int) -> Epoch:
+def compute_epoch_of_slot(slot: Slot, slots_per_epoch: int) -> Epoch:
     return Epoch(slot // slots_per_epoch)
 
 
-def get_epoch_start_slot(epoch: Epoch, slots_per_epoch: int) -> Slot:
+def compute_start_slot_of_epoch(epoch: Epoch, slots_per_epoch: int) -> Slot:
     return Slot(epoch * slots_per_epoch)
 
 
-def _get_block_root(
-        latest_block_roots: Sequence[Hash32],
-        state_slot: Slot,
-        slot: Slot,
-        latest_block_roots_length: int) -> Hash32:
-    """
-    Return the block root at a recent ``slot``.
-    """
-    if state_slot > slot + latest_block_roots_length:
-        raise ValidationError(
-            "state.slot ({}) should be less than or equal to "
-            "(slot + latest_block_roots_length) ({}), "
-            "where slot={}, latest_block_roots_length={}".format(
-                state_slot,
-                slot + latest_block_roots_length,
-                slot,
-                latest_block_roots_length,
-            )
-        )
-    if slot >= state_slot:
-        raise ValidationError(
-            "slot ({}) should be less than state.slot ({})".format(
-                slot,
-                state_slot,
-            )
-        )
-    return latest_block_roots[slot % latest_block_roots_length]
-
-
-def get_block_root(
-        state: 'BeaconState',
-        slot: Slot,
-        latest_block_roots_length: int) -> Hash32:
-    """
-    Return the block root at a recent ``slot``.
-    """
-    return _get_block_root(
-        state.latest_block_roots,
-        state.slot,
-        slot,
-        latest_block_roots_length,
-    )
-
-
-def get_randao_mix(state: 'BeaconState',
-                   epoch: Epoch,
-                   slots_per_epoch: int,
-                   latest_randao_mixes_length: int) -> Hash32:
-    """
-    Return the randao mix at a recent ``epoch``.
-    """
-    validate_epoch_for_active_randao_mix(
-        state.current_epoch(slots_per_epoch),
-        epoch,
-        latest_randao_mixes_length,
-    )
-
-    return state.latest_randao_mixes[epoch % latest_randao_mixes_length]
-
-
-def get_active_validator_indices(validators: Sequence['ValidatorRecord'],
-                                 epoch: Epoch) -> Tuple[ValidatorIndex, ...]:
+def get_active_validator_indices(
+    validators: Sequence[Validator], epoch: Epoch
+) -> Tuple[ValidatorIndex, ...]:
     """
     Get indices of active validators from ``validators``.
     """
@@ -120,77 +44,139 @@ def get_active_validator_indices(validators: Sequence['ValidatorRecord'],
     )
 
 
-def generate_seed(state: 'BeaconState',
-                  epoch: Epoch,
-                  slots_per_epoch: int,
-                  min_seed_lookahead: int,
-                  activation_exit_delay: int,
-                  latest_active_index_roots_length: int,
-                  latest_randao_mixes_length: int) -> Hash32:
+def _get_historical_root(
+    historical_roots: Sequence[Hash32],
+    state_slot: Slot,
+    slot: Slot,
+    slots_per_historical_root: int,
+) -> Hash32:
     """
-    Generate a seed for the given ``epoch``.
+    Return the historical root at a recent ``slot``.
     """
-    randao_mix = get_randao_mix(
-        state=state,
-        epoch=Epoch(epoch - min_seed_lookahead),
-        slots_per_epoch=slots_per_epoch,
-        latest_randao_mixes_length=latest_randao_mixes_length,
+    if slot >= state_slot:
+        raise ValidationError(
+            f"slot ({slot}) should be less than state.slot ({state_slot})"
+        )
+
+    if state_slot > slot + slots_per_historical_root:
+        raise ValidationError(
+            f"state.slot ({state_slot}) should be less than or equal to "
+            f"(slot + slots_per_historical_root) ({slot + slots_per_historical_root}), "
+            f"where slot={slot}, slots_per_historical_root={slots_per_historical_root}"
+        )
+
+    return historical_roots[slot % slots_per_historical_root]
+
+
+def get_block_root_at_slot(
+    state: "BeaconState", slot: Slot, slots_per_historical_root: int
+) -> Hash32:
+    """
+    Return the block root at a recent ``slot``.
+    """
+    return _get_historical_root(
+        state.block_roots, state.slot, slot, slots_per_historical_root
     )
-    active_index_root = get_active_index_root(
-        state=state,
-        epoch=epoch,
-        slots_per_epoch=slots_per_epoch,
-        activation_exit_delay=activation_exit_delay,
-        latest_active_index_roots_length=latest_active_index_roots_length,
+
+
+def get_block_root(
+    state: "BeaconState",
+    epoch: Epoch,
+    slots_per_epoch: int,
+    slots_per_historical_root: int,
+) -> Hash32:
+    return get_block_root_at_slot(
+        state,
+        compute_start_slot_of_epoch(epoch, slots_per_epoch),
+        slots_per_historical_root,
     )
-    epoch_as_bytes = epoch.to_bytes(32, byteorder="little")
+
+
+def get_randao_mix(
+    state: "BeaconState", epoch: Epoch, epochs_per_historical_vector: int
+) -> Hash32:
+    """
+    Return the randao mix at a recent ``epoch``.
+    """
+    return state.randao_mixes[epoch % epochs_per_historical_vector]
+
+
+def get_active_index_root(
+    state: "BeaconState", epoch: Epoch, epochs_per_historical_vector: int
+) -> Hash32:
+    """
+    Return the index root at a recent ``epoch``.
+    """
+    return state.active_index_roots[epoch % epochs_per_historical_vector]
+
+
+def _epoch_for_seed(epoch: Epoch) -> Hash32:
+    return Hash32(epoch.to_bytes(32, byteorder="little"))
+
+
+RandaoProvider = Callable[["BeaconState", Epoch, int], Hash32]
+ActiveIndexRootProvider = Callable[["BeaconState", Epoch, int], Hash32]
+
+
+def _get_seed(
+    state: "BeaconState",
+    epoch: Epoch,
+    randao_provider: RandaoProvider,
+    active_index_root_provider: ActiveIndexRootProvider,
+    epoch_provider: Callable[[Epoch], Hash32],
+    committee_config: CommitteeConfig,
+) -> Hash32:
+    randao_mix = randao_provider(
+        state,
+        Epoch(
+            epoch
+            + committee_config.EPOCHS_PER_HISTORICAL_VECTOR
+            - committee_config.MIN_SEED_LOOKAHEAD
+            - 1
+        ),
+        committee_config.EPOCHS_PER_HISTORICAL_VECTOR,
+    )
+    active_index_root = active_index_root_provider(
+        state, epoch, committee_config.EPOCHS_PER_HISTORICAL_VECTOR
+    )
+    epoch_as_bytes = epoch_provider(epoch)
 
     return hash_eth2(randao_mix + active_index_root + epoch_as_bytes)
 
 
-def get_active_index_root(state: 'BeaconState',
-                          epoch: Epoch,
-                          slots_per_epoch: int,
-                          activation_exit_delay: int,
-                          latest_active_index_roots_length: int) -> Hash32:
+def get_seed(
+    state: "BeaconState", epoch: Epoch, committee_config: CommitteeConfig
+) -> Hash32:
     """
-    Return the index root at a recent ``epoch``.
+    Generate a seed for the given ``epoch``.
     """
-    validate_epoch_for_active_index_root(
-        state.current_epoch(slots_per_epoch),
+    return _get_seed(
+        state,
         epoch,
-        activation_exit_delay,
-        latest_active_index_roots_length,
+        get_randao_mix,
+        get_active_index_root,
+        _epoch_for_seed,
+        committee_config,
     )
 
-    return state.latest_active_index_roots[epoch % latest_active_index_roots_length]
 
-
-def get_effective_balance(
-        validator_balances: Sequence[Gwei],
-        index: ValidatorIndex,
-        max_deposit_amount: Gwei) -> Gwei:
-    """
-    Return the effective balance (also known as "balance at stake") for a
-    ``validator`` with the given ``index``.
-    """
-    return min(validator_balances[index], max_deposit_amount)
-
-
-def get_total_balance(validator_balances: Sequence[Gwei],
-                      validator_indices: Sequence[ValidatorIndex],
-                      max_deposit_amount: Gwei) -> Gwei:
+def get_total_balance(
+    state: "BeaconState", validator_indices: Set[ValidatorIndex]
+) -> Gwei:
     """
     Return the combined effective balance of an array of validators.
     """
-    return Gwei(sum(
-        get_effective_balance(validator_balances, index, max_deposit_amount)
-        for index in validator_indices
-    ))
+    return Gwei(
+        max(
+            sum(
+                state.validators[index].effective_balance for index in validator_indices
+            ),
+            1,
+        )
+    )
 
 
-def get_fork_version(fork: 'Fork',
-                     epoch: Epoch) -> int:
+def _get_fork_version(fork: Fork, epoch: Epoch) -> Version:
     """
     Return the current ``fork_version`` from the given ``fork`` and ``epoch``.
     """
@@ -200,58 +186,32 @@ def get_fork_version(fork: 'Fork',
         return fork.current_version
 
 
-def get_domain(fork: 'Fork',
-               epoch: Epoch,
-               domain_type: SignatureDomain) -> int:
+def _signature_domain_to_domain_type(s: SignatureDomain) -> DomainType:
+    return DomainType(s.to_bytes(4, byteorder="little"))
+
+
+def compute_domain(
+    signature_domain: SignatureDomain, fork_version: Version = default_version
+) -> Domain:
+    """
+    NOTE: we deviate from the spec here by taking the enum ``SignatureDomain`` and
+    converting before creating the domain.
+    """
+    domain_type = _signature_domain_to_domain_type(signature_domain)
+    return Domain(domain_type + fork_version)
+
+
+def get_domain(
+    state: "BeaconState",
+    signature_domain: SignatureDomain,
+    slots_per_epoch: int,
+    message_epoch: Epoch = None,
+) -> Domain:
     """
     Return the domain number of the current fork and ``domain_type``.
     """
-    # 2 ** 32 = 4294967296
-    return get_fork_version(
-        fork,
-        epoch,
-    ) * 4294967296 + domain_type
-
-
-def is_double_vote(attestation_data_1: 'AttestationData',
-                   attestation_data_2: 'AttestationData',
-                   slots_per_epoch: int) -> bool:
-    """
-    Assumes ``attestation_data_1`` is distinct from ``attestation_data_2``.
-
-    Return True if the provided ``AttestationData`` are slashable
-    due to a 'double vote'.
-    """
-    return (
-        slot_to_epoch(attestation_data_1.slot, slots_per_epoch) ==
-        slot_to_epoch(attestation_data_2.slot, slots_per_epoch)
+    epoch = (
+        state.current_epoch(slots_per_epoch) if message_epoch is None else message_epoch
     )
-
-
-def is_surround_vote(attestation_data_1: 'AttestationData',
-                     attestation_data_2: 'AttestationData',
-                     slots_per_epoch: int) -> bool:
-    """
-    Assumes ``attestation_data_1`` is distinct from ``attestation_data_2``.
-
-    Return True if the provided ``AttestationData`` are slashable
-    due to a 'surround vote'.
-
-    Note: parameter order matters as this function only checks
-    that ``attestation_data_1`` surrounds ``attestation_data_2``.
-    """
-    source_epoch_1 = attestation_data_1.justified_epoch
-    source_epoch_2 = attestation_data_2.justified_epoch
-    target_epoch_1 = slot_to_epoch(attestation_data_1.slot, slots_per_epoch)
-    target_epoch_2 = slot_to_epoch(attestation_data_2.slot, slots_per_epoch)
-    return source_epoch_1 < source_epoch_2 and target_epoch_2 < target_epoch_1
-
-
-def get_delayed_activation_exit_epoch(
-        epoch: Epoch,
-        activation_exit_delay: int) -> Epoch:
-    """
-    An entry or exit triggered in the ``epoch`` given by the input takes effect at
-    the epoch given by the output.
-    """
-    return Epoch(epoch + 1 + activation_exit_delay)
+    fork_version = _get_fork_version(state.fork, epoch)
+    return compute_domain(signature_domain, fork_version)
